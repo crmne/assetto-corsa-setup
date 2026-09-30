@@ -1,0 +1,665 @@
+#!/usr/bin/env bash
+#
+# assetto-corsa-setup: make a Steam install of Assetto Corsa playable on Linux,
+# with Content Manager and Custom Shaders Patch set up and nothing left to click.
+#
+# Install Assetto Corsa in Steam, then run this. It is safe to run again.
+#
+# Based on https://github.com/sihawido/assettocorsa-linux-setup, made
+# non-interactive and extended to configure Content Manager. GPL-2.0, like it.
+
+set -euo pipefail
+
+APPID=244210
+PROTON_DEFAULT="GE-Proton11-7"        # newest GE-Proton tested with AC + CM
+PROTON="${PROTON:-$PROTON_DEFAULT}"
+CSP_VERSION_DEFAULT="0.2.11"
+CSP_VERSION="${CSP_VERSION:-}"        # set to force (re)installing that version
+FIRST_RUN_TIMEOUT=1800                # seconds to wait for Proton's first-run fixes
+
+CACHE_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/assetto-corsa-setup"
+PLUGIN_CACHE="$CACHE_DIR/plugins"
+AC_DESKTOP="$HOME/.local/share/applications/Assetto Corsa.desktop"
+
+FRESH=0
+INSTALL_CSP=1
+AC_COMMON=""
+
+if [[ -t 1 ]]; then
+  bold=$'\033[1m'; yellow=$'\033[33m'; red=$'\033[1;31m'; reset=$'\033[0m'
+else
+  bold=""; yellow=""; red=""; reset=""
+fi
+
+step() { echo "${bold}==>${reset} $*"; }
+info() { echo "    $*"; }
+warn() { echo "${yellow}warning:${reset} $*" >&2; }
+die()  { echo "${red}error:${reset} $*" >&2; exit 1; }
+
+trap 'echo "${red}error:${reset} command failed at line $LINENO: $BASH_COMMAND" >&2' ERR
+
+usage() {
+  cat <<EOF
+Usage: $(basename "$0") [options]
+
+Sets up Assetto Corsa (Steam app $APPID) on Linux:
+  - installs GE-Proton ($PROTON_DEFAULT unless told otherwise) and tells
+    Steam to use it for Assetto Corsa
+  - installs Content Manager in place of the stock launcher
+  - installs Custom Shaders Patch and the fonts both need
+  - creates the Wine prefix by running the game once, and waits for it
+  - points Content Manager at the game, picks your Steam profile and
+    restores its plugins, so it opens ready to use
+
+Options:
+  --fresh          delete the Wine prefix and rebuild it (game settings, Content
+                   Manager settings, presets and plugins are kept)
+  --no-csp         do not install Custom Shaders Patch
+  --proton TAG     GE-Proton release to use: a tag such as GE-Proton11-7, or
+                   "latest" (default $PROTON_DEFAULT). Switching rebuilds the
+                   Wine prefix, keeping settings as --fresh does.
+  --ac-path DIR    path to steamapps/common/assettocorsa, if it is not found
+  -h, --help       show this help
+
+Environment:
+  PROTON           same as --proton
+  CSP_VERSION      install this Custom Shaders Patch version, replacing the
+                   installed one (default $CSP_VERSION_DEFAULT, only if none is installed)
+EOF
+}
+
+while (( $# )); do
+  case "$1" in
+    --fresh) FRESH=1 ;;
+    --no-csp) INSTALL_CSP=0 ;;
+    --proton) [[ $# -ge 2 ]] || die "--proton needs a release tag or latest"; PROTON="$2"; shift ;;
+    --ac-path) [[ $# -ge 2 ]] || die "--ac-path needs a directory"; AC_COMMON="${2%/}"; shift ;;
+    -h|--help) usage; exit 0 ;;
+    *) usage >&2; die "unknown option: $1" ;;
+  esac
+  shift
+done
+
+[[ "$(id -u)" != "0" ]] || die "do not run this as root"
+
+for bin in curl tar unzip python3 sha512sum pgrep; do
+  command -v "$bin" > /dev/null || die "$bin is not installed"
+done
+
+TMP="$(mktemp -d)"
+trap 'rm -rf "$TMP"' EXIT
+
+download() { # url destination
+  curl -fL --retry 3 --progress-bar -o "$2" "$1" || die "download failed: $1"
+}
+
+# ---------------------------------------------------------------- locating --
+
+# Every Steam installation we know about: "kind|directory".
+steam_candidates() {
+  local native="$HOME/.local/share/Steam"
+  if [[ ! -d "$native" ]] && [[ -L "$HOME/.steam/root" ]]; then
+    native="$(readlink -f "$HOME/.steam/root")"
+  fi
+  echo "native|$native"
+  echo "flatpak|$HOME/.var/app/com.valvesoftware.Steam/data/Steam"
+  echo "snap|$HOME/snap/steam/common/.local/share/Steam"
+}
+
+library_paths() { # steam_dir
+  local vdf="$1/steamapps/libraryfolders.vdf"
+  echo "$1"
+  [[ -f "$vdf" ]] && grep -oP '"path"\s+"\K[^"]+' "$vdf" | sed 's|\\\\|/|g'
+  return 0
+}
+
+find_steam_and_ac() {
+  local kind dir lib found_steam=0
+  while IFS='|' read -r kind dir; do
+    [[ -d "$dir" ]] || continue
+    found_steam=1
+    if [[ -n "$AC_COMMON" ]]; then
+      STEAM_KIND="$kind"; STEAM_DIR="$dir"
+      return 0
+    fi
+    while IFS= read -r lib; do
+      if [[ -d "$lib/steamapps/common/assettocorsa" ]]; then
+        STEAM_KIND="$kind"; STEAM_DIR="$dir"
+        AC_COMMON="$lib/steamapps/common/assettocorsa"
+        return 0
+      fi
+    done < <(library_paths "$dir")
+  done < <(steam_candidates)
+  (( found_steam )) || die "Steam is not installed"
+  die "Assetto Corsa is not installed. Install it in Steam first, or pass --ac-path."
+}
+
+STEAM_KIND=""; STEAM_DIR=""
+find_steam_and_ac
+
+[[ "$(basename "$AC_COMMON")" == "assettocorsa" && -d "$AC_COMMON" ]] \
+  || die "'$AC_COMMON' is not a steamapps/common/assettocorsa directory"
+[[ -f "$AC_COMMON/acs.exe" ]] \
+  || die "Assetto Corsa in '$AC_COMMON' is incomplete; let Steam finish installing it"
+
+case "$STEAM_KIND" in
+  native)  STEAM_CMD=(steam) ;;
+  flatpak) STEAM_CMD=(flatpak run com.valvesoftware.Steam) ;;
+  snap)    STEAM_CMD=(snap run steam) ;;
+esac
+
+STEAMAPPS="${AC_COMMON%/common/assettocorsa}"
+COMPATDATA="$STEAMAPPS/compatdata/$APPID"
+PFX="$COMPATDATA/pfx"
+WIN_USER="$PFX/drive_c/users/steamuser"
+AC_DOCS="$WIN_USER/Documents/Assetto Corsa"
+CM_DATA="$WIN_USER/AppData/Local/AcTools Content Manager"
+CONFIG_BACKUP="$STEAMAPPS/compatdata/$APPID.assetto-corsa-setup"
+READY_MARKER="$COMPATDATA/.assetto-corsa-setup-ready"
+COMPAT_TOOLS_DIR="$STEAM_DIR/compatibilitytools.d"
+WIN_AC_ROOT="Z:${AC_COMMON//\//\\}"
+
+step "Found Assetto Corsa"
+info "$AC_COMMON ($STEAM_KIND Steam)"
+
+if [[ "$(findmnt -no FSTYPE --target "$AC_COMMON" 2> /dev/null)" =~ ^(ntfs|ntfs3|fuseblk|exfat|vfat)$ ]]; then
+  warn "Assetto Corsa is on a Windows filesystem; Proton games are unreliable there."
+fi
+
+# --------------------------------------------------------------- processes --
+
+steam_running() { pgrep -x steam > /dev/null; }
+game_session_running() { pgrep -f "SteamLaunch AppId=$APPID" > /dev/null; }
+# Wine processes of the launcher / Content Manager and of the simulator itself.
+launcher_pids() { pgrep -f '^[A-Za-z]:\\.*\\AssettoCorsa\.exe' || true; }
+
+stop_game_session() {
+  local pids i
+  pids="$(launcher_pids)"
+  # shellcheck disable=SC2086
+  [[ -z "$pids" ]] || kill $pids 2> /dev/null || true
+  for (( i = 0; i < 30; i++ )); do
+    game_session_running || return 0
+    sleep 1
+  done
+  pkill -f "SteamLaunch AppId=$APPID" || true
+  sleep 2
+}
+
+stop_steam() {
+  local i
+  steam_running || return 0
+  info "Closing Steam so it picks up the change..."
+  "${STEAM_CMD[@]}" -shutdown > /dev/null 2>&1 || true
+  for (( i = 0; i < 60; i++ )); do
+    steam_running || { sleep 2; return 0; }
+    sleep 1
+  done
+  die "Steam did not close; quit it and run this again"
+}
+
+if game_session_running || [[ -n "$(launcher_pids)" ]] || pgrep -f '\\acs(_x86)?\.exe' > /dev/null; then
+  die "Assetto Corsa or Content Manager is running; close it and run this again"
+fi
+
+# ------------------------------------------------------------ plugin cache --
+
+# Content Manager only hands out its plugins to itself, so whatever it has
+# downloaded is kept here and put back into new prefixes.
+has_plugins() { # directory
+  compgen -G "$1/*/Manifest.json" > /dev/null
+}
+
+save_plugins() {
+  local dir
+  has_plugins "$CM_DATA/Plugins" || return 0
+  mkdir -p "$PLUGIN_CACHE"
+  for dir in "$CM_DATA/Plugins"/*/; do
+    [[ -f "$dir/Manifest.json" ]] || continue
+    rm -rf "${PLUGIN_CACHE:?}/$(basename "$dir")"
+    cp -a "$dir" "$PLUGIN_CACHE/"
+  done
+}
+
+restore_plugins() {
+  local dir name
+  has_plugins "$PLUGIN_CACHE" || return 0
+  mkdir -p "$CM_DATA/Plugins"
+  for dir in "$PLUGIN_CACHE"/*/; do
+    name="$(basename "$dir")"
+    [[ -e "$CM_DATA/Plugins/$name" ]] || cp -a "$dir" "$CM_DATA/Plugins/"
+  done
+}
+
+save_plugins
+
+# ---------------------------------------------------------------- ProtonGE --
+
+# Prints the Steam name of the installed compatibility tool built from release
+# $1 (a GE-Proton tag), if there is one.
+installed_tool() {
+  local dir name
+  for dir in "$COMPAT_TOOLS_DIR"/*/; do
+    [[ -f "$dir/compatibilitytool.vdf" && -f "$dir/proton" ]] || continue
+    name="$(grep -A2 '"compat_tools"' "$dir/compatibilitytool.vdf" | tail -n1 | grep -oP '"\K[^"]+' | head -n1)"
+    if [[ "$name" == "$1" || "$name" == "$1-x86_64" ]]; then
+      echo "$name"
+      return 0
+    fi
+  done
+  return 1
+}
+
+# Looks up a GE-Proton release: prints "tag tarball-url checksum-url".
+proton_release() { # tag | latest
+  local api="https://api.github.com/repos/GloriousEggroll/proton-ge-custom/releases"
+  if [[ "$1" == "latest" ]]; then api="$api/latest"; else api="$api/tags/$1"; fi
+  curl -fsSL "$api" | python3 -c '
+import json, re, sys
+release = json.load(sys.stdin)
+tag = release["tag_name"]
+assets = {a["name"]: a["browser_download_url"] for a in release["assets"]}
+for suffix in ("-x86_64", ""):
+    tarball, checksum = tag + suffix + ".tar.gz", tag + suffix + ".sha512sum"
+    if tarball in assets and checksum in assets:
+        print(tag, assets[tarball], assets[checksum])
+        break
+' 2> /dev/null || true
+}
+
+install_proton() { # tag tarball-url checksum-url
+  local tarball="${2##*/}" checksum="${3##*/}"
+  step "Installing $1"
+  stop_steam
+  download "$2" "$TMP/$tarball"
+  download "$3" "$TMP/$checksum"
+  (cd "$TMP" && sha512sum --quiet -c "$checksum") || die "$1 download is corrupt"
+  mkdir -p "$COMPAT_TOOLS_DIR"
+  tar -xzf "$TMP/$tarball" -C "$COMPAT_TOOLS_DIR"
+  rm -f "$TMP/$tarball"
+}
+
+# Reads or sets the compatibility tool Steam uses for the game, in config.vdf.
+compat_tool() { # get | set
+  python3 - "$1" "$STEAM_DIR/config/config.vdf" "$APPID" "$TOOL_NAME" <<'PY'
+import re, sys
+
+action, path, appid, tool = sys.argv[1:5]
+text = open(path, encoding="utf-8", errors="surrogateescape").read()
+
+def block(key, start, end):
+    """Span (open brace, close brace) of the block named key inside text[start:end]."""
+    m = re.compile(r'"%s"\s*\{' % re.escape(key), re.I).search(text, start, end)
+    if not m:
+        return None
+    depth, i, quoted = 0, m.end() - 1, False
+    while i < end:
+        c = text[i]
+        if quoted:
+            if c == "\\":
+                i += 1
+            elif c == '"':
+                quoted = False
+        elif c == '"':
+            quoted = True
+        elif c == "{":
+            depth += 1
+        elif c == "}":
+            depth -= 1
+            if depth == 0:
+                return m.end() - 1, i
+        i += 1
+    return None
+
+span = (0, len(text))
+for key in ("InstallConfigStore", "Software", "Valve", "Steam"):
+    found = block(key, span[0], span[1])
+    if not found:
+        sys.exit("cannot find %s in %s" % (key, path))
+    span = found
+steam = span
+
+mapping = block("CompatToolMapping", steam[0], steam[1])
+entry = block(appid, mapping[0], mapping[1]) if mapping else None
+current = None
+if entry:
+    m = re.search(r'"name"\s+"([^"]*)"', text[entry[0]:entry[1]])
+    current = m.group(1) if m else None
+
+if action == "get":
+    print(current or "")
+    sys.exit(0)
+
+if current == tool:
+    sys.exit(0)
+
+body = '\n%(t)s\t"name"\t\t"%(tool)s"\n%(t)s\t"config"\t\t""\n%(t)s\t"priority"\t\t"250"\n%(t)s'
+if entry:
+    indent = re.search(r"[ \t]*$", text[:entry[1]]).group(0)
+    text = text[:entry[0] + 1] + body % {"t": indent, "tool": tool} + text[entry[1]:]
+elif mapping:
+    indent = re.search(r"[ \t]*$", text[:mapping[1]]).group(0)
+    t = indent + "\t"
+    new = '\t"%s"\n%s{%s}\n%s' % (appid, t, body % {"t": t, "tool": tool}, indent)
+    text = text[:mapping[1]] + new + text[mapping[1]:]
+else:
+    indent = re.search(r"[ \t]*$", text[:steam[1]]).group(0)
+    t, t2 = indent + "\t", indent + "\t\t"
+    new = '\t"CompatToolMapping"\n%s{\n%s"%s"\n%s{%s}\n%s}\n%s' % (
+        t, t2, appid, t2, body % {"t": t2, "tool": tool}, t, indent)
+    text = text[:steam[1]] + new + text[steam[1]:]
+
+open(path, "w", encoding="utf-8", errors="surrogateescape").write(text)
+PY
+}
+
+[[ -f "$STEAM_DIR/config/config.vdf" ]] || die "Steam has never been started; start it once and log in"
+
+if [[ "$PROTON" == "latest" ]]; then
+  read -r PROTON _ < <(proton_release latest) || true
+  [[ -n "$PROTON" ]] || die "could not look up the latest GE-Proton release"
+fi
+if ! TOOL_NAME="$(installed_tool "$PROTON")"; then
+  read -r tag tarball_url checksum_url < <(proton_release "$PROTON") || true
+  [[ -n "${tag:-}" ]] || die "cannot find GE-Proton release '$PROTON'"
+  install_proton "$tag" "$tarball_url" "$checksum_url"
+  TOOL_NAME="$(installed_tool "$PROTON")" || die "$PROTON did not install correctly"
+fi
+
+current_tool="$(compat_tool get)"
+if [[ "$current_tool" != "$TOOL_NAME" ]]; then
+  step "Telling Steam to run Assetto Corsa with $TOOL_NAME"
+  [[ -z "$current_tool" ]] || info "(it was set to $current_tool)"
+  stop_steam
+  cp "$STEAM_DIR/config/config.vdf" "$STEAM_DIR/config/config.vdf.assetto-corsa-setup.bak"
+  compat_tool set
+  [[ "$(compat_tool get)" == "$TOOL_NAME" ]] || die "could not set the compatibility tool in config.vdf"
+else
+  step "Steam already runs Assetto Corsa with $TOOL_NAME"
+fi
+
+# ----------------------------------------------------------------- prefix --
+
+# A prefix built by another Proton version does not survive the switch.
+if [[ -f "$COMPATDATA/version" ]] && (( ! FRESH )); then
+  prefix_tool="$(head -n1 "$COMPATDATA/version")"
+  if [[ "$prefix_tool" != "$PROTON" ]]; then
+    warn "the Wine prefix was made by $prefix_tool; rebuilding it for $PROTON."
+    FRESH=1
+  fi
+fi
+
+# Settings moved aside by an earlier run that did not finish go back first.
+restore_config_backup() {
+  [[ -d "$CONFIG_BACKUP" ]] || return 0
+  if [[ -d "$CONFIG_BACKUP/Assetto Corsa" && ! -e "$AC_DOCS" ]]; then
+    mkdir -p "$(dirname "$AC_DOCS")"
+    mv "$CONFIG_BACKUP/Assetto Corsa" "$AC_DOCS"
+  fi
+  if [[ -d "$CONFIG_BACKUP/AcTools Content Manager" && ! -e "$CM_DATA" ]]; then
+    mkdir -p "$(dirname "$CM_DATA")"
+    mv "$CONFIG_BACKUP/AcTools Content Manager" "$CM_DATA"
+  fi
+  rmdir "$CONFIG_BACKUP" 2> /dev/null \
+    || warn "older settings were left in $CONFIG_BACKUP because newer ones exist"
+}
+
+if (( FRESH )) && [[ -d "$COMPATDATA" ]]; then
+  step "Rebuilding the Wine prefix (keeping settings, presets and plugins)"
+  mkdir -p "$CONFIG_BACKUP"
+  [[ ! -d "$AC_DOCS" || -e "$CONFIG_BACKUP/Assetto Corsa" ]] || mv "$AC_DOCS" "$CONFIG_BACKUP/"
+  [[ ! -d "$CM_DATA" || -e "$CONFIG_BACKUP/AcTools Content Manager" ]] || mv "$CM_DATA" "$CONFIG_BACKUP/"
+  rm -rf "$COMPATDATA"
+fi
+restore_config_backup
+
+# ------------------------------------------------- Content Manager and CSP --
+
+is_content_manager() { grep -aq "AcManager" "$1"; }
+
+step "Content Manager"
+if [[ -f "$AC_COMMON/AssettoCorsa.exe" ]] && is_content_manager "$AC_COMMON/AssettoCorsa.exe"; then
+  info "already installed"
+else
+  info "downloading..."
+  download "https://acstuff.club/app/latest.zip" "$TMP/cm.zip"
+  mkdir "$TMP/cm"
+  unzip -q "$TMP/cm.zip" -d "$TMP/cm"
+  [[ -f "$TMP/cm/Content Manager.exe" ]] || die "unexpected Content Manager download"
+  # Steam puts the stock launcher back when it updates or verifies the game.
+  if [[ -f "$AC_COMMON/AssettoCorsa.exe" ]]; then
+    mv -f "$AC_COMMON/AssettoCorsa.exe" "$AC_COMMON/AssettoCorsa_original.exe"
+  fi
+  cp "$TMP/cm/Content Manager.exe" "$AC_COMMON/AssettoCorsa.exe"
+  [[ ! -f "$TMP/cm/Manifest.json" ]] || cp "$TMP/cm/Manifest.json" "$AC_COMMON/"
+  info "installed; the stock launcher is kept as AssettoCorsa_original.exe"
+fi
+
+if [[ ! -f "$AC_COMMON/content/fonts/system/segoeui.ttf" ]]; then
+  info "installing its fonts..."
+  download "https://files.acstuff.ru/shared/T0Zj/fonts.zip" "$TMP/fonts.zip"
+  mkdir "$TMP/fonts"
+  unzip -q "$TMP/fonts.zip" -d "$TMP/fonts"
+  mkdir -p "$AC_COMMON/content/fonts"
+  cp -r "$TMP/fonts/system" "$AC_COMMON/content/fonts/"
+fi
+
+installed_csp_version() {
+  local manifest="$AC_COMMON/extension/config/data_manifest.ini"
+  [[ -f "$manifest" && -f "$AC_COMMON/dwrite.dll" ]] || return 0
+  sed -n 's/^SHADERS_PATCH=\(.*\)$/\1/p' "$manifest" | tr -d '\r' | head -n1
+}
+
+if (( INSTALL_CSP )); then
+  step "Custom Shaders Patch"
+  csp_installed="$(installed_csp_version)"
+  if [[ -n "$csp_installed" && ( -z "$CSP_VERSION" || "$CSP_VERSION" == "$csp_installed" ) ]]; then
+    info "v$csp_installed already installed"
+  else
+    csp_wanted="${CSP_VERSION:-$CSP_VERSION_DEFAULT}"
+    info "downloading v$csp_wanted..."
+    download "https://acstuff.club/patch/?get=$csp_wanted" "$TMP/csp.zip"
+    unzip -tq "$TMP/csp.zip" > /dev/null || die "Custom Shaders Patch v$csp_wanted could not be downloaded"
+    unzip -qo "$TMP/csp.zip" -d "$AC_COMMON"
+    rm -f "$TMP/csp.zip"
+    info "installed v$csp_wanted"
+  fi
+fi
+
+# ------------------------------------------------ Content Manager settings --
+
+steam_id() {
+  local id
+  id="$(grep -oP '"LastOwner"\s+"\K[0-9]+' "$STEAMAPPS/appmanifest_$APPID.acf" 2> /dev/null | head -n1 || true)"
+  if [[ -z "$id" || "$id" == "0" ]]; then
+    id="$(python3 - "$STEAM_DIR/config/loginusers.vdf" <<'PY' || true
+import re, sys
+try:
+    text = open(sys.argv[1], encoding="utf-8", errors="replace").read()
+except OSError:
+    sys.exit(0)
+users = re.findall(r'"(\d{17})"\s*\{(.*?)\}', text, re.S)
+recent = [u for u, body in users if re.search(r'"MostRecent"\s+"1"', body)]
+print((recent or [u for u, _ in users] or [""])[0])
+PY
+)"
+  fi
+  echo "$id"
+}
+
+# Writes settings into Content Manager's Values.data, keeping everything else.
+cm_set_values() { # key=value...
+  mkdir -p "$CM_DATA"
+  python3 - "$CM_DATA/Values.data" "$@" <<'PY'
+import os, sys, zlib
+
+path, pairs = sys.argv[1], [a.split("=", 1) for a in sys.argv[2:]]
+
+def lzf_decompress(data):
+    out, i = bytearray(), 0
+    while i < len(data):
+        ctrl = data[i]; i += 1
+        if ctrl < 32:
+            out += data[i:i + ctrl + 1]; i += ctrl + 1
+        else:
+            length = ctrl >> 5
+            if length == 7:
+                length += data[i]; i += 1
+            ref = len(out) - ((ctrl & 0x1F) << 8) - data[i] - 1; i += 1
+            if ref < 0:
+                raise ValueError("corrupt LZF data")
+            for _ in range(length + 2):
+                out.append(out[ref]); ref += 1
+    return bytes(out)
+
+def load(path):
+    try:
+        raw = open(path, "rb").read()
+    except OSError:
+        return b""
+    if not raw:
+        return b""
+    if raw[0] == 11:
+        return lzf_decompress(raw[1:])
+    if raw[0] == 0:
+        return zlib.decompress(raw[1:], -15)
+    if any(b < 0x20 and b not in (9, 10, 13) for b in raw):
+        return zlib.decompress(raw, -15)
+    return raw
+
+def encode(value):
+    return value.replace("\\", "\\\\").replace("\n", "\\n").replace("\t", "\\t").replace("\r", "")
+
+try:
+    lines = load(path).decode("utf-8").split("\n")
+except Exception as e:
+    sys.exit("cannot read %s: %s" % (path, e))
+if lines and lines[0].startswith("version:"):
+    if lines[0].strip() != "version: 2":
+        sys.exit("%s has an unknown format (%s)" % (path, lines[0]))
+    lines = lines[1:]
+lines = [l for l in lines if l]
+
+for key, value in pairs:
+    prefix = encode(key) + "\t"
+    lines = [l for l in lines if not l.startswith(prefix)]
+    lines.append(prefix + encode(value))
+
+# Content Manager reads the file as plain text when it holds no control bytes.
+tmp = path + ".tmp"
+with open(tmp, "w", encoding="utf-8", newline="\n") as f:
+    f.write("version: 2\n" + "\n".join(lines) + "\n")
+os.replace(tmp, path)
+PY
+}
+
+configure_content_manager() {
+  local values=("_ac_root=$WIN_AC_ROOT") id
+  id="$(steam_id)"
+  [[ -z "$id" ]] || values+=("SteamId=$id")
+  restore_plugins
+  # With plugins in place there is nothing left for the first-run wizard to ask.
+  if has_plugins "$CM_DATA/Plugins"; then
+    values+=("_wizardVersion=2" "_second_run=0")
+  fi
+  cm_set_values "${values[@]}"
+
+  # Lets Content Manager see which Steam account is logged in.
+  mkdir -p "$PFX/drive_c/Program Files (x86)/Steam/config"
+  ln -sfn "$STEAM_DIR/config/loginusers.vdf" "$PFX/drive_c/Program Files (x86)/Steam/config/loginusers.vdf"
+
+  # Its Start Menu shortcut makes it crash on startup under Wine.
+  rm -f "$WIN_USER/AppData/Roaming/Microsoft/Windows/Start Menu/Programs/Content Manager.lnk"
+}
+
+step "Configuring Content Manager"
+configure_content_manager
+info "game folder: $WIN_AC_ROOT"
+if has_plugins "$CM_DATA/Plugins"; then
+  info "plugins: $(find "$CM_DATA/Plugins" -mindepth 2 -maxdepth 2 -name Manifest.json | wc -l) installed"
+fi
+
+# ---------------------------------------------------------------- first run --
+
+# Proton builds the prefix and installs .NET and friends the first time the
+# game starts. That takes minutes and shows nothing, so do it here and wait.
+first_run() {
+  local waited=0 last="" now
+  step "Starting Assetto Corsa once so Proton can build its Wine prefix"
+  info "This takes several minutes and shows no window until it is done."
+  setsid -f "${STEAM_CMD[@]}" -applaunch "$APPID" > /dev/null 2>&1
+  until [[ -n "$(launcher_pids)" ]]; do
+    sleep 3
+    (( waited += 3 ))
+    if [[ -f "$PFX/winetricks.log" ]]; then
+      now="$(tail -n1 "$PFX/winetricks.log")"
+      [[ "$now" == "$last" ]] || { info "installed: $now"; last="$now"; }
+    fi
+    if (( waited > 300 )) && ! game_session_running; then
+      die "Assetto Corsa stopped before its launcher came up; start it from Steam and look for a prompt"
+    fi
+    (( waited < FIRST_RUN_TIMEOUT )) || die "gave up after $(( FIRST_RUN_TIMEOUT / 60 )) minutes waiting for Assetto Corsa to start"
+  done
+  info "Content Manager came up; closing it to finish the setup."
+  sleep 15
+  stop_game_session
+}
+
+if [[ ! -f "$READY_MARKER" || ! -f "$PFX/user.reg" ]]; then
+  first_run
+  [[ -f "$PFX/user.reg" ]] || die "Proton did not create the Wine prefix"
+  # Content Manager was running; make sure its settings are still what we want.
+  configure_content_manager
+  touch "$READY_MARKER"
+else
+  step "Wine prefix is already set up"
+fi
+
+if (( INSTALL_CSP )) && ! grep -qx "corefonts" "$PFX/winetricks.log" 2> /dev/null; then
+  if command -v protontricks > /dev/null; then
+    step "Installing the fonts Custom Shaders Patch needs (this takes a while)"
+    STEAM_DIR="$STEAM_DIR" protontricks "$APPID" corefonts > "$TMP/corefonts.log" 2>&1 \
+      || { tail -n 20 "$TMP/corefonts.log" >&2; warn "could not install corefonts; text in Custom Shaders Patch apps may look wrong"; }
+  else
+    warn "protontricks is not installed; skipping the fonts Custom Shaders Patch needs"
+  fi
+fi
+
+# ----------------------------------------------------------- desktop entry --
+
+step "Desktop entry"
+mkdir -p "$(dirname "$AC_DESKTOP")"
+launch="${STEAM_CMD[*]} -applaunch $APPID %u"
+if [[ -f "$AC_DESKTOP" ]]; then
+  sed -i "s|^Exec=.*|Exec=$launch|" "$AC_DESKTOP"
+else
+  cat > "$AC_DESKTOP" <<EOF
+[Desktop Entry]
+Name=Assetto Corsa
+Comment=Play this game on Steam
+Exec=$launch
+Icon=steam_icon_$APPID
+Terminal=false
+Type=Application
+Categories=Game;
+EOF
+fi
+if command -v xdg-mime > /dev/null; then
+  xdg-mime default "Assetto Corsa.desktop" x-scheme-handler/acmanager
+  info "acmanager:// links open in Content Manager (while it is not already open)"
+fi
+
+save_plugins
+steam_running || setsid -f "${STEAM_CMD[@]}" -silent > /dev/null 2>&1
+
+echo
+echo "${bold}Assetto Corsa is set up.${reset} Start it from Steam; it opens Content Manager."
+if ! has_plugins "$CM_DATA/Plugins"; then
+  cat <<EOF
+
+Content Manager will show its welcome screen once, with the game folder filled
+in. Click "Install recommended plugins", then OK. Do not create the Start Menu
+shortcut. Run this script again afterwards and it will keep the plugins
+for any future rebuild.
+EOF
+fi

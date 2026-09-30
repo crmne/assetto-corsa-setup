@@ -4,7 +4,7 @@ One command that makes Assetto Corsa on Steam playable on Linux, with
 [Content Manager](https://acstuff.club/app/) and
 [Custom Shaders Patch](https://acstuff.club/patch/) installed and configured.
 It asks no questions, and Content Manager opens ready to race: game folder set,
-Steam profile picked, plugins in place.
+Steam profile picked, plugins in place, readable text at your display's scale.
 
 ```sh
 curl -fLO https://raw.githubusercontent.com/crmne/assetto-corsa-setup/main/assetto-corsa-setup
@@ -30,7 +30,12 @@ time; it only changes what is missing or wrong.
    installs .NET and the other components the game needs. This takes several
    minutes and shows nothing, which is why a first launch often looks broken.
 7. Installs the Windows core fonts Custom Shaders Patch needs.
-8. Points the Assetto Corsa desktop entry at Steam and registers it for
+8. Fixes Content Manager's look. Proton maps Segoe UI, its interface font, to
+   Times New Roman; the script installs [Selawik](https://github.com/microsoft/Selawik),
+   Microsoft's open-source Segoe UI stand-in, in its place, and turns on font
+   smoothing. It also sets Content Manager's interface scale to your display's
+   (see below).
+9. Points the Assetto Corsa desktop entry at Steam and registers it for
    `acmanager://` links.
 
 Then start Assetto Corsa from Steam and it opens Content Manager.
@@ -41,11 +46,21 @@ Then start Assetto Corsa from Steam and it opens Content Manager.
 |---|---|
 | `--fresh` | Delete the Wine prefix and rebuild it. Game settings, Content Manager settings, presets and plugins are kept. Try this first if the game stops starting. |
 | `--proton TAG` | GE-Proton release to use, such as `GE-Proton11-7`, or `latest`. Switching rebuilds the prefix, keeping settings. |
+| `--scale N` | Content Manager's interface scale, such as `1.5`. Overrides whatever is set. |
 | `--no-csp` | Skip Custom Shaders Patch. |
 | `--ac-path DIR` | Path to `steamapps/common/assettocorsa`, if it is not found. |
 
 `CSP_VERSION=0.2.x` installs that Custom Shaders Patch version over the
 installed one.
+
+## Interface scale
+
+On a HiDPI display Content Manager is tiny, because Wine draws X11 windows at
+100%. The script sets Content Manager's own interface scale to your display's
+scale, read from Hyprland's focused monitor (when XWayland apps are left
+unscaled) or from `Xft.dpi`. It sets it once: if you change the scale in
+Content Manager's settings later, running the script again keeps your choice.
+Pass `--scale` to override it.
 
 ## Content Manager plugins
 

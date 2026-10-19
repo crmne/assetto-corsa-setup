@@ -29,6 +29,7 @@ PURE_ARCHIVE=""
 PURE_MODE=auto
 HUD_ARCHIVE=""
 HUD_MODE=auto
+INSTALL_MOZA_TELEMETRY=1
 
 if [[ -t 1 ]]; then
   bold=$'\033[1m'; yellow=$'\033[33m'; red=$'\033[1;31m'; reset=$'\033[0m'
@@ -68,6 +69,7 @@ Options:
   --hud ZIP        install your local CMRT Essential or Complete HUD ZIP
                    (default: detect Downloads, preferring Complete)
   --no-hud         skip local HUD detection and installation
+  --no-moza-telemetry  skip the CSP app that sends exact RPM limits to MOZA
   --proton TAG     GE-Proton release to use: a tag such as GE-Proton11-7, or
                    "latest" (default $PROTON_DEFAULT). Switching rebuilds the
                    Wine prefix, keeping settings as --fresh does.
@@ -92,6 +94,7 @@ while (( $# )); do
     --no-pure) PURE_MODE=skip; PURE_ARCHIVE="" ;;
     --hud) [[ $# -ge 2 && -f "$2" ]] || die "--hud needs a local CMRT Essential or Complete HUD ZIP"; HUD_ARCHIVE="$2"; HUD_MODE=explicit; shift ;;
     --no-hud) HUD_MODE=skip; HUD_ARCHIVE="" ;;
+    --no-moza-telemetry) INSTALL_MOZA_TELEMETRY=0 ;;
     --proton) [[ $# -ge 2 ]] || die "--proton needs a release tag or latest"; PROTON="$2"; shift ;;
     --scale) [[ $# -ge 2 && "$2" =~ ^[0-9]+(\.[0-9]+)?$ ]] || die "--scale needs a number such as 1.5"; SCALE="$2"; shift ;;
     --ac-path) [[ $# -ge 2 ]] || die "--ac-path needs a directory"; AC_COMMON="${2%/}"; shift ;;
@@ -1409,6 +1412,83 @@ if [[ -n "$HUD_ARCHIVE" ]]; then
   hud_setup install
 elif [[ "$HUD_MODE" != skip ]]; then
   info "No local CMRT HUD ZIP found; use --hud ZIP to install one."
+fi
+
+# ------------------------------------------------------- exact MOZA RPM --
+
+moza_telemetry_setup() {
+  python3 - "$AC_COMMON" "$CACHE_DIR" <<'PY_MOZA'
+from datetime import datetime
+from pathlib import Path
+import shutil
+import sys
+
+game, cache = map(Path, sys.argv[1:])
+if not (game / "dwrite.dll").is_file():
+    print("    MOZA telemetry needs CSP; skipping.")
+    raise SystemExit(0)
+app = game / "apps/lua/OmarchyMoza"
+files = {
+    "manifest.ini": """[ABOUT]
+NAME = MOZA Rev Telemetry
+AUTHOR = Carmine Paolino
+VERSION = 1.0
+DESCRIPTION = Sends current RPM and the car's actual limiter to the local MOZA panel.
+
+[CORE]
+LAZY = NONE
+""",
+    "OmarchyMoza.lua": """-- CSP supplies the actual limit on every frame, including after car changes.
+-- Only loopback UDP is used; no telemetry leaves this computer.
+local socket = require('shared/socket')
+local sender = assert(socket.udp())
+sender:settimeout(0)
+sender:setsockname('127.0.0.1', 0)
+ac.onRelease(function() sender:close() end)
+local elapsed = 0
+
+function script.update(dt)
+  elapsed = elapsed + dt
+  if elapsed < 1 / 60 then return end
+  elapsed = elapsed % (1 / 60)
+  local car = ac.getCar(0)
+  if not car then return end
+  local limit = math.floor(car.rpmLimiter + 0.5)
+  local idle = math.max(0, math.floor(car.rpmMinimum + 0.5))
+  if limit <= idle then return end
+  local sim = ac.getSim()
+  local rpm = (sim.isPaused or sim.isReplayActive or sim.isInMainMenu)
+    and 0 or math.max(0, math.floor(car.rpm + 0.5))
+  sender:sendto(string.format(
+    '{"protocol":"omarchy-moza-ac/1","rpm":%d,"redline":%d,"idle":%d}',
+    rpm, limit, idle), '127.0.0.1', 9997)
+end
+""",
+}
+backup = cache / "backups" / ("moza-telemetry-" + datetime.now().strftime("%Y%m%d-%H%M%S-%f"))
+# Check every destination before writing anything.
+for name in files:
+    dest = app / name
+    if dest.is_symlink() or not dest.resolve().is_relative_to(game.resolve()):
+        raise SystemExit("MOZA telemetry destination escapes the game folder")
+for name, data in files.items():
+    dest = app / name
+    if dest.exists() and dest.read_text() == data:
+        continue
+    if dest.exists():
+        backup.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(dest, backup / name)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_text(data)
+print("    MOZA receives the car's actual RPM limit via localhost UDP :9997 next session.")
+if backup.exists():
+    print(f"    Previous telemetry app backed up in {backup}")
+PY_MOZA
+}
+
+if (( INSTALL_MOZA_TELEMETRY )); then
+  step "MOZA rev lights: actual Assetto Corsa RPM limit"
+  moza_telemetry_setup
 fi
 
 # ----------------------------------------------------------- desktop entry --

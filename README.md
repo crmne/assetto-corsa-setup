@@ -41,6 +41,8 @@ time; it only changes what is missing or wrong.
     fuel indicator, and arranges a modern HUD for your resolution.
 11. Points the Assetto Corsa desktop entry at Steam and registers it for
    `acmanager://` links.
+12. Installs a small CSP background app for accurate MOZA rev lights, using
+    the current car's actual RPM limit, including low-revving cars.
 
 Then start Assetto Corsa from Steam and it opens Content Manager.
 
@@ -56,10 +58,31 @@ Then start Assetto Corsa from Steam and it opens Content Manager.
 | `--no-pure` | Skip automatic Pure detection and installation. |
 | `--hud ZIP` | Install your downloaded CMRT Essential 1.0.13 or Complete 2.1.3 ZIP and arrange its apps once. |
 | `--no-hud` | Skip automatic HUD detection and installation. |
+| `--no-moza-telemetry` | Skip the CSP companion for accurate MOZA rev lights. |
 | `--ac-path DIR` | Path to `steamapps/common/assettocorsa`, if it is not found. |
 
 `CSP_VERSION=0.2.x` installs that Custom Shaders Patch version over the
 installed one.
+
+## MOZA rev lights
+
+With CSP installed, the script adds `apps/lua/OmarchyMoza`, a background app
+with no HUD window. It sends RPM, limiter and idle RPM from the player's car
+to `127.0.0.1:9997` at up to 60 Hz. No telemetry leaves this computer.
+Use an updated [Omarchy MOZA panel](https://github.com/crmne/omarchy-moza)
+that supports this feed. The app starts with the next driving session.
+
+There is no guessed 7,000 RPM ceiling or minimum engine-speed assumption.
+Switching cars or changing the limiter takes effect with the next sample;
+over-revving does not raise the limit. Replays and menus send zero RPM, and
+the panel clears the lights when telemetry stops. Cars without a reported
+limiter do not produce rev-light data. Existing threshold percentages and
+colors remain configurable in the panel.
+
+Reruns preserve identical files and back up replaced companion files under
+`~/.local/share/assetto-corsa-setup/backups/moza-telemetry-*`. Pass
+`--no-moza-telemetry` to skip installation; this does not remove an existing
+installation. Remove `apps/lua/OmarchyMoza` to uninstall the companion.
 
 ## Pure 3.59
 

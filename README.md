@@ -37,7 +37,9 @@ time; it only changes what is missing or wrong.
    (see below).
 9. If you have a local Pure 3.59 ZIP, installs it and selects a natural SDR
    preset with Pure LCS weather and the matching Pure post-processing filter.
-10. Points the Assetto Corsa desktop entry at Steam and registers it for
+10. If you have a local CMRT Essential or Complete HUD ZIP, installs its apps, flags and
+    fuel indicator, and arranges a modern HUD for your resolution.
+11. Points the Assetto Corsa desktop entry at Steam and registers it for
    `acmanager://` links.
 
 Then start Assetto Corsa from Steam and it opens Content Manager.
@@ -52,6 +54,8 @@ Then start Assetto Corsa from Steam and it opens Content Manager.
 | `--no-csp` | Skip Custom Shaders Patch. |
 | `--pure ZIP` | Install your downloaded Pure 3.59 ZIP and apply the natural SDR preset once. |
 | `--no-pure` | Skip automatic Pure detection and installation. |
+| `--hud ZIP` | Install your downloaded CMRT Essential 1.0.13 or Complete 2.1.3 ZIP and arrange its apps once. |
+| `--no-hud` | Skip automatic HUD detection and installation. |
 | `--ac-path DIR` | Path to `steamapps/common/assettocorsa`, if it is not found. |
 
 `CSP_VERSION=0.2.x` installs that Custom Shaders Patch version over the
@@ -93,6 +97,53 @@ configuration folder, respectively; `new-files.txt` records added files.
 The installer prints the exact backup path. Highres needs about 5 GB for
 the installed files plus temporary space for extraction and any backup.
 
+## Modern HUD
+
+Download the free [CMRT Essential HUD](https://www.overtake.gg/downloads/cmrt-essential-hud.69475/)
+or purchase [CMRT Complete HUD](https://www.patreon.com/CMRT/shop/cmrt-complete-hud-563983)
+from its author separately. The installer detects `CMRT_essential_hud*.zip` and
+`CMRT_Complete_hud*.zip` in Downloads, ignoring filename case. If both editions
+are present, Complete takes precedence. Multiple ZIPs of the selected edition
+require an explicit path:
+
+```sh
+./assetto-corsa-setup --hud "$HOME/Downloads/CMRT_essential_hud_v1.0.13.zip"
+# Or the purchased edition:
+./assetto-corsa-setup --hud "$HOME/Downloads/CMRT_Complete_hud_v2.1.3.zip"
+```
+
+Essential 1.0.13 and Complete 2.1.3 are supported, with CSP 0.2.3 or newer. No CMRT files are bundled
+or downloaded by this project. Both Pure and CMRT can be installed in the same
+run; `--no-hud` skips HUD detection and installation.
+
+On first setup, seven apps are enabled on the current AC desktop: gear/speed/
+RPM/fuel, leaderboard, lap and sector timing, delta, circuit map, tyres with
+pedal bars, and radar. Complete adds damage and MFD panels, with traction
+control, brake bias and lights in a fresh MFD preset. The radar sits low and
+centered near the bottom edge, with the MFD above it.
+Positions and default app sizes adapt to the configured
+resolution, leaving the road view clear. The overlapping stock equivalents
+and stock leaderboard strip are hidden, and the virtual mirror is enabled.
+Both AC's desktop settings and CSP's separate window-position cache are set.
+CMRT settings, separate pedal graphs,
+and clocks remain available from the in-game app sidebar.
+
+The archive's matching flags and fuel indicator are installed too. Complete
+also installs its starting-light replacement and hides the stock damage panel.
+Switching editions backs up and removes the other app folder to avoid duplicate
+HUDs. Saved preferences remain in place, and each edition's layout is retained.
+Automatic detection never replaces installed Complete with Essential; use
+`--hud` explicitly to switch back. That switch restores the starting lights and
+damage-display setting this installer replaced, preserving later user edits.
+
+Replaced
+files and configuration are backed up under
+`~/.local/share/assetto-corsa-setup/backups/cmrt-<edition>-<version>-*`, with the same
+`game/`, `cfg/`, and `new-files.txt` structure as Pure backups. Saved CMRT
+preferences and existing visible layouts are preserved; later runs keep your
+positions and sizes. Default sizes are changed only in the local copy of
+CMRT's settings file, and saved preferences take precedence.
+
 ## Interface scale
 
 On a HiDPI display Content Manager is tiny, because Wine draws X11 windows at
@@ -123,7 +174,10 @@ fresh install to a quick race and a clean exit.
 
 Pure 3.59 Highres with Pure LCS and the SDR preset was also checked in a
 running race on this setup. HDR output and other Pure versions are not tested.
-
+CMRT Essential HUD 1.0.13 and Complete 2.1.3 were checked in a 3840×2160 race,
+including readable text, live gauges, and matching flag/fuel assets. Complete's
+radar and damage display were checked with nearby cars. Other
+resolutions have automated layout checks but have not been checked in-game.
 
 ## Development checks
 
@@ -132,7 +186,7 @@ bash -n assetto-corsa-setup
 python3 -m unittest discover -s tests -v
 ```
 
-The Pure regression tests use synthetic ZIP files and require no mod
+The Pure and HUD regression tests use synthetic ZIP files and require no mod
 assets or game installation. They cover installation, backups, preserving
 settings and layouts, repeat runs, unsupported versions, and malformed archives.
 

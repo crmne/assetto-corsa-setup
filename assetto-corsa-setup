@@ -27,6 +27,8 @@ INSTALL_CSP=1
 AC_COMMON=""
 PURE_ARCHIVE=""
 PURE_MODE=auto
+HUD_ARCHIVE=""
+HUD_MODE=auto
 
 if [[ -t 1 ]]; then
   bold=$'\033[1m'; yellow=$'\033[33m'; red=$'\033[1;31m'; reset=$'\033[0m'
@@ -63,6 +65,9 @@ Options:
   --pure ZIP       install your locally downloaded Pure 3.59 ZIP and a natural
                    SDR preset (default: detect Pure 3.59*.zip in Downloads)
   --no-pure        skip local Pure detection and installation
+  --hud ZIP        install your local CMRT Essential or Complete HUD ZIP
+                   (default: detect Downloads, preferring Complete)
+  --no-hud         skip local HUD detection and installation
   --proton TAG     GE-Proton release to use: a tag such as GE-Proton11-7, or
                    "latest" (default $PROTON_DEFAULT). Switching rebuilds the
                    Wine prefix, keeping settings as --fresh does.
@@ -85,6 +90,8 @@ while (( $# )); do
     --no-csp) INSTALL_CSP=0 ;;
     --pure) [[ $# -ge 2 && -f "$2" ]] || die "--pure needs a local Pure 3.59 ZIP"; PURE_ARCHIVE="$2"; PURE_MODE=explicit; shift ;;
     --no-pure) PURE_MODE=skip; PURE_ARCHIVE="" ;;
+    --hud) [[ $# -ge 2 && -f "$2" ]] || die "--hud needs a local CMRT Essential or Complete HUD ZIP"; HUD_ARCHIVE="$2"; HUD_MODE=explicit; shift ;;
+    --no-hud) HUD_MODE=skip; HUD_ARCHIVE="" ;;
     --proton) [[ $# -ge 2 ]] || die "--proton needs a release tag or latest"; PROTON="$2"; shift ;;
     --scale) [[ $# -ge 2 && "$2" =~ ^[0-9]+(\.[0-9]+)?$ ]] || die "--scale needs a number such as 1.5"; SCALE="$2"; shift ;;
     --ac-path) [[ $# -ge 2 ]] || die "--ac-path needs a directory"; AC_COMMON="${2%/}"; shift ;;
@@ -437,6 +444,435 @@ if [[ -n "$PURE_ARCHIVE" ]]; then
   step "Checking your local Pure archive"
   pure_setup check
 fi
+
+# --------------------------------------------------------------- local HUD --
+
+# Only install the user's original archive; do not redistribute CMRT assets.
+hud_setup() { # check | install
+  python3 - "$1" "$HUD_ARCHIVE" "$AC_COMMON" "$AC_DOCS" "$CACHE_DIR" <<'PY_HUD'
+import configparser
+from datetime import datetime
+import hashlib
+import io
+import json
+import os
+from pathlib import Path, PurePosixPath
+import re
+import shutil
+import stat
+import sys
+import tempfile
+import zipfile
+
+mode, archive, game, documents, cache = sys.argv[1:]
+game, documents, cache = map(Path, (game, documents, cache))
+editions = {"Essential": "1.0.13", "Complete": "2.1.3"}
+components = (
+    "manifest.ini", "settings/first.lua",
+    "common/settings.lua", "common/players.lua", "radar/first.lua",
+    "gearbox/first.lua", "leaderboard/first.lua", "tires/first.lua",
+    "map/first.lua", "sectors/first.lua", "deltabar/first.lua",
+    "auto_resize.ini", "manual_resize.ini", "CHANGELOG.txt",
+)
+
+def ini(path):
+    c = configparser.ConfigParser(interpolation=None, strict=False)
+    c.optionxform = str
+    if path.exists():
+        c.read(path, encoding="utf-8-sig")
+    return c
+
+def safe_members(bundle):
+    seen = set()
+    for member in bundle.infolist():
+        name = member.filename
+        p = PurePosixPath(name)
+        if (not p.parts or p.is_absolute() or ".." in p.parts or "\\" in name
+                or any(":" in part for part in p.parts)
+                or stat.S_ISLNK(member.external_attr >> 16) or member.flag_bits & 1):
+            raise SystemExit("HUD archive contains an unsafe or encrypted entry")
+        if member.is_dir():
+            continue
+        key = str(p).casefold()
+        if key in seen:
+            raise SystemExit("HUD archive contains duplicate paths")
+        seen.add(key)
+        yield member
+
+payload = {}
+with zipfile.ZipFile(archive) as bundle:
+    members = list(safe_members(bundle))
+    manifests = [(m.filename, edition) for m in members for edition in editions
+                 if m.filename.endswith(f"apps/lua/CMRT-{edition}-HUD/manifest.ini")]
+    if len(manifests) != 1:
+        raise SystemExit("Expected one original CMRT Essential or Complete HUD ZIP")
+    manifest_path, edition = manifests[0]
+    app_name = f"CMRT-{edition}-HUD"
+    title = f"CMRT {edition} HUD"
+    app = f"apps/lua/{app_name}/"
+    version = editions[edition]
+    other_edition = "Essential" if edition == "Complete" else "Complete"
+    other_app = f"apps/lua/CMRT-{other_edition}-HUD"
+    required = {app + p for p in (*components, app_name + ".lua")}
+    if edition == "Complete":
+        required.update(app + p for p in ("damagepanel/first.lua", "mfd/first.lua"))
+    prefix = manifest_path[:-len(app + "manifest.ini")]
+    for member in members:
+        if member.filename.startswith(prefix + app):
+            rel = member.filename[len(prefix):]
+            payload[rel] = bundle.read(member)  # CRC verification before any writes
+    if not required.issubset(payload):
+        raise SystemExit(title + " archive is missing required components")
+    manifest = configparser.ConfigParser(interpolation=None, strict=False)
+    manifest.read_string(payload[app + "manifest.ini"].decode("utf-8-sig"))
+    if (manifest.get("ABOUT", "VERSION", fallback="").strip() != version
+            or manifest.get("ABOUT", "NAME", fallback="").strip() != title):
+        raise SystemExit("Supported HUD versions: Essential 1.0.13 and Complete 2.1.3")
+    # Include the author's matching flags and fuel indicator, preserving the
+    # real originals locally instead of using the archive's stock backups.
+    for member in members:
+        if PurePosixPath(member.filename).name in (
+                "CMRT_flag_and_fuel_replacement.zip",
+                "CMRT_flag_fuel_and_starting_lights_replacement.zip"):
+            with zipfile.ZipFile(io.BytesIO(bundle.read(member))) as graphics:
+                for graphic in safe_members(graphics):
+                    rel = graphic.filename
+                    if ((rel.startswith(("content/gui/flags/", "content/gui/fuelIndicator/"))
+                         and rel.endswith(".png") and not rel.endswith("_backup.png"))
+                            or (edition == "Complete" and rel == "content/texture/off.png")):
+                        if rel in payload:
+                            raise SystemExit("HUD archive contains duplicate graphics")
+                        payload[rel] = graphics.read(graphic)
+
+for rel in payload:
+    target = game / rel
+    if target.is_symlink() or not target.resolve().is_relative_to(game.resolve()):
+        raise SystemExit("HUD destination escapes the game directory")
+other_path = game / other_app
+if other_path.is_symlink() or not other_path.resolve().is_relative_to(game.resolve()):
+    raise SystemExit("Other HUD edition escapes the game directory")
+if mode == "check":
+    print(f"    Verified local {title} {version} archive and file integrity")
+    sys.exit(0)
+if mode != "install":
+    raise SystemExit("Unknown HUD operation")
+csp = ini(game / "extension/config/data_manifest.ini")
+csp_version = re.match(r"(\d+)\.(\d+)\.(\d+)", csp.get("VERSION", "SHADERS_PATCH", fallback=""))
+if not (game / "dwrite.dll").is_file() or not csp_version or tuple(map(int, csp_version.groups())) < (0, 2, 3):
+    raise SystemExit("CMRT HUD needs Custom Shaders Patch 0.2.3 or newer")
+
+fingerprint = hashlib.sha256(Path(archive).read_bytes()).hexdigest()
+install_id = hashlib.sha256(str(game.resolve()).encode()).hexdigest()[:16]
+state_file = cache / "hud" / (install_id + ".json")
+state = json.loads(state_file.read_text()) if state_file.exists() else {}
+backup = cache / "backups" / (f"cmrt-{edition.lower()}-{version}-" + datetime.now().strftime("%Y%m%d-%H%M%S-%f"))
+backed_up = set()
+
+def write(path, data, category, rel):
+    if path.is_file() and path.read_bytes() == data:
+        return
+    if str(path) not in backed_up:
+        backed_up.add(str(path))
+        if path.exists():
+            dest = backup / category / rel
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(path, dest)
+        else:
+            backup.mkdir(parents=True, exist_ok=True)
+            with (backup / "new-files.txt").open("a") as f:
+                f.write(str(path) + "\n")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temp = tempfile.mkstemp(prefix=".cmrt-", dir=path.parent)
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+        os.chmod(temp, 0o644)
+        os.replace(temp, path)
+    finally:
+        if os.path.exists(temp):
+            os.unlink(temp)
+
+video = ini(documents / "cfg/video.ini")
+width = max(800, video.getint("VIDEO", "WIDTH", fallback=1920))
+height = max(600, video.getint("VIDEO", "HEIGHT", fallback=1080))
+gui = ini(documents / "cfg/extension/gui.ini")
+ui_scale = max(0.5, gui.getfloat("NEW_UI", "UI_SCALE", fallback=1))
+app_scale = round(min(2, max(0.5, height / 1080 / ui_scale)), 3)
+physical_scale = app_scale * ui_scale
+payload_revision = 2 if edition == "Complete" else 1
+installed = (state.get("fingerprint") == fingerprint
+             and state.get("payload_revision", 1) == payload_revision
+             and all((game / p).is_file() for p in payload))
+if not installed:
+    # Change defaults in the locally supplied file. Saved preferences in CSP's
+    # storage still take precedence; no third-party source is bundled here.
+    rel = app + "settings/first.lua"
+    settings = payload[rel].decode("utf-8-sig")
+    scale_keys = ["gearbox", "sectors", "leaderboard", "tyres", "map", "deltabar", "pedals", "radar"]
+    if edition == "Complete":
+        scale_keys += ["damage_panel", "mfd"]
+    for key in scale_keys:
+        settings, count = re.subn(r"(\b" + key + r"_scale\s*=\s*)1(?=\s*,)",
+                                  lambda m: m[1] + str(app_scale), settings, count=1)
+        if count != 1:
+            raise SystemExit("Unsupported CMRT scale settings; game files were not changed")
+        if edition == "Complete":
+            # Complete has both legacy migration defaults and current defaults.
+            settings, count = re.subn(
+                r'(\b' + key + r'_scale\s*=\s*make_setting_storage\("[^"]+",\s*)1(?=\))',
+                lambda m: m[1] + str(app_scale), settings, count=1)
+            if count != 1:
+                raise SystemExit("Unsupported Complete scale settings; game files were not changed")
+    if edition == "Complete":
+        # First launch must respect the layout below. The app still saves it as
+        # a custom layout, and its Reset/Default Layout controls keep working.
+        settings, count = re.subn(r'(ac\.storage\("First_Time_Opening_Complete",\s*)false(?=\))',
+                                 r'\g<1>true', settings, count=1)
+        if count != 1:
+            raise SystemExit("Unsupported Complete layout settings; game files were not changed")
+    payload[rel] = settings.encode()
+    if edition == "Complete":
+        # Give a fresh MFD useful information even in cars without ABS, and
+        # populate its drawing row immediately on the first launch.
+        rel = app + "mfd/first.lua"
+        mfd, count = re.subn(
+            r'(MFD_PRESETS\[0\]\.mfd_row1\[1\]\s*=\s*)MFD_Type\.ABS',
+            r'\g<1>MFD_Type.BRAKE_BIAS\n'
+            '            MFD_PRESETS[0].mfd_row1[2] = MFD_Type.LIGHTS\n'
+            '            MFD_Row1 = table.clone(MFD_PRESETS[0].mfd_row1, true)',
+            payload[rel].decode("utf-8-sig"), count=1)
+        if count != 1:
+            raise SystemExit("Unsupported Complete MFD defaults; game files were not changed")
+        payload[rel] = mfd.encode()
+
+# Validate and prepare config before moving either edition or writing game files.
+pending_cfg = {}
+
+def save_cfg(rel, c):
+    out = io.StringIO()
+    c.write(out, space_around_delimiters=False)
+    pending_cfg[rel] = out.getvalue().encode()
+
+def set_values(c, section, values):
+    if not c.has_section(section):
+        c.add_section(section)
+    for k, v in values.items():
+        c.set(section, k, str(v))
+
+acos_path = documents / "cfg/acos.ini"
+acos = ini(acos_path)
+same_edition = state.get("edition", "Essential") == edition
+visibility = state.setdefault("edition_visibility", {})
+restored_visibility = visibility.get(edition, {}) if not same_edition else {}
+for section, visible in restored_visibility.items():
+    if acos.has_section(section):
+        set_values(acos, section, {"VISIBLE": visible})
+        save_cfg("acos.ini", acos)
+if not same_edition or not state.get("configured") or not acos_path.exists():
+    # AC's selected desktop is one-based, while its form sections are zero-based.
+    selected = min(4, max(1, acos.getint("HEADER", "DESKTOP_SELECTED", fallback=1)))
+    desk = selected - 1
+    cmrt_prefix = f"DESK_{desk}_FORM_IMGUI_LUA_{title}_WINDOW_"
+    existing_layout = any(s.startswith(cmrt_prefix) and (s in restored_visibility or acos.get(s, "VISIBLE", fallback="0") == "1")
+                          for s in acos.sections())
+    if not existing_layout:
+        s = physical_scale
+        margin = 40 * s
+        positions = {
+            0: (width - 415*s, height - 175*s),       # gear, RPM, speed, fuel
+            1: (width - 395*s, 65*s),                # lap and sector timing
+            2: (margin, 65*s),                       # position and nearby drivers
+            3: (margin, height - 260*s),             # tyre information + pedal bars
+            4: (margin, height * 0.37),              # circuit map below leaderboard
+            7: ((width - 303*s)/2, height - 260*s),   # low, centered radar near the bottom edge
+            9: ((width - 600*s)/2, height * 0.20),    # delta below the mirror
+        }
+        sizes = {0: (369, 129), 1: (351, 208), 2: (427, 298), 3: (481, 249),
+                 4: (357, 372), 7: (303, 318), 9: (600, 158)}
+        if edition == "Complete":
+            # Complete inserts Damage before Pedals, shifting Deltabar to 10.
+            positions[10] = positions.pop(9)
+            sizes[10] = sizes.pop(9)
+            positions[8] = (width - 180*s, height - 370*s)
+            sizes[8] = (140, 140)
+            positions[12] = ((width - 380*s)/2, height - 370*s)
+            sizes[12] = (380, 100)
+        imgui = ini(documents / "cfg/extension/state/imgui_settings.ini")
+        for index in range(13 if edition == "Complete" else 11):
+            x, y = positions.get(index, (margin, margin))
+            set_values(acos, cmrt_prefix + str(index), {
+                "POSX": round(max(0, x)), "POSY": round(max(0, y)),
+                "VISIBLE": int(index in positions), "BLOCKED": 0, "SCALE": 1,
+            })
+            if index in sizes:
+                w, h = sizes[index]
+                value = ",".join(str(round(v)) for v in (max(0, x), max(0, y), w*s, h*s))
+                set_values(imgui, f"IMGUI_APP_POS_SIZE_{desk}", {
+                    f"IMGUI_LUA_{title}_WINDOW_{index}": value,
+                })
+        for name in ("AC_ESSENTIALS", "LEADERBOARD_APP", "RACE_POSITION", "TYRES_APP", "KSMAP", "LAP_TIME", "FORM_GEAR", "PEDALS"):
+            set_values(acos, f"DESK_{desk}_FORM_{name}", {"VISIBLE": 0})
+        set_values(acos, "HEADER", {"VERSION": 2, "DESKTOP_SELECTED": selected})
+        save_cfg("acos.ini", acos)
+        save_cfg("extension/state/imgui_settings.ini", imgui)
+        # Discard CMRT's cached window sizes so its auto-resizer does not shift
+        # the new positions using dimensions from an earlier layout.
+        storage_rel = f"extension/state/lua/app/{app_name}.ini"
+        storage = ini(documents / "cfg" / storage_rel)
+        if storage.remove_section("VEC2"):
+            save_cfg(storage_rel, storage)
+        gameplay = ini(documents / "cfg/gameplay.ini")
+        set_values(gameplay, "OVERLAY_LEADERBOARD", {"ACTIVE": 0})
+        set_values(gameplay, "VIRTUAL_MIRROR", {"ACTIVE": 1})
+        if edition == "Complete":
+            state.setdefault("stock_damage_display", gameplay.get("DAMAGE_DISPLAYER", "IS_ACTIVE", fallback=None))
+            set_values(gameplay, "DAMAGE_DISPLAYER", {"IS_ACTIVE": 0})
+        save_cfg("gameplay.ini", gameplay)
+        print(f"    Arranged {len(positions)} HUD apps for {width}x{height}")
+    else:
+        print("    Existing CMRT layout preserved")
+if edition == "Complete" and restored_visibility:
+    gameplay = ini(documents / "cfg/gameplay.ini")
+    state.setdefault("stock_damage_display", gameplay.get("DAMAGE_DISPLAYER", "IS_ACTIVE", fallback=None))
+    set_values(gameplay, "DAMAGE_DISPLAYER", {"IS_ACTIVE": 0})
+    save_cfg("gameplay.ini", gameplay)
+if edition == "Complete" and same_edition and state.get("configured") and state.get("payload_revision", 1) < 2:
+    # Upgrade our initial MFD placement only if it is still at our old default.
+    # The user's radar position and any moved MFD are kept.
+    selected = min(4, max(1, acos.getint("HEADER", "DESKTOP_SELECTED", fallback=1)))
+    desk = selected - 1
+    key = f"IMGUI_LUA_{title}_WINDOW_12"
+    section = f"DESK_{desk}_FORM_{key}"
+    imgui = ini(documents / "cfg/extension/state/imgui_settings.ini")
+    coords = imgui.get(f"IMGUI_APP_POS_SIZE_{desk}", key, fallback="").split(",")
+    if len(coords) == 4:
+        x, y, w, h = map(float, coords)
+        s = physical_scale
+        if abs(x - (width - 380*s)/2) < 2 and abs(y - (height - 150*s)) < 2:
+            x, y = round((width - w)/2), round(height - 370*s)
+            set_values(acos, section, {"POSX": x, "POSY": y})
+            set_values(imgui, f"IMGUI_APP_POS_SIZE_{desk}", {key: f"{x},{y},{w:g},{h:g}"})
+            save_cfg("acos.ini", acos)
+            save_cfg("extension/state/imgui_settings.ini", imgui)
+# Hide the removed edition on every desktop, retaining its saved coordinates so
+# an explicit switch back can recover the user's old layout.
+removed_prefix = f"_FORM_IMGUI_LUA_CMRT {other_edition} HUD_WINDOW_"
+if not same_edition or other_path.exists():
+    previous_visibility = {s: acos.get(s, "VISIBLE", fallback="0")
+                           for s in acos.sections() if removed_prefix in s}
+    if previous_visibility:
+        visibility[other_edition] = previous_visibility
+for section in acos.sections():
+    if removed_prefix in section and acos.get(section, "VISIBLE", fallback="0") != "0":
+        set_values(acos, section, {"VISIBLE": 0})
+        save_cfg("acos.ini", acos)
+
+# A return to Essential also restores the stock starting lights and damage
+# display that this installer replaced for Complete. Keep later user edits.
+restore_light = None
+light_rel = "content/texture/off.png"
+light_path = game / light_rel
+light_state = state.get("complete_starting_lights")
+if edition == "Essential" and light_state:
+    if light_path.is_file() and hashlib.sha256(light_path.read_bytes()).hexdigest() == light_state["installed_sha256"]:
+        original = light_state.get("original")
+        if original and Path(original).is_file():
+            restore_light = Path(original).read_bytes()
+        else:
+            raise SystemExit("No original starting lights to restore; restore them with Steam before switching to Essential")
+    state.pop("complete_starting_lights", None)
+if edition == "Essential" and "stock_damage_display" in state:
+    gameplay = ini(documents / "cfg/gameplay.ini")
+    if "gameplay.ini" in pending_cfg:
+        gameplay.read_string(pending_cfg["gameplay.ini"].decode())
+    previous = state.pop("stock_damage_display")
+    if gameplay.get("DAMAGE_DISPLAYER", "IS_ACTIVE", fallback=None) == "0":
+        if previous is None:
+            gameplay.remove_option("DAMAGE_DISPLAYER", "IS_ACTIVE")
+        else:
+            set_values(gameplay, "DAMAGE_DISPLAYER", {"IS_ACTIVE": previous})
+        save_cfg("gameplay.ini", gameplay)
+
+if other_path.exists():
+    retired = backup / "game" / other_app
+    retired.parent.mkdir(parents=True, exist_ok=True)
+    shutil.move(str(other_path), str(retired))
+    print(f"    Backed up and removed {other_edition} HUD to avoid duplicate apps")
+if not installed:
+    if edition == "Complete" and light_rel in payload and not light_state:
+        state["complete_starting_lights"] = {
+            "original": str(backup / "game" / light_rel) if light_path.is_file() else None,
+            "installed_sha256": hashlib.sha256(payload[light_rel]).hexdigest(),
+        }
+        # Remember even identical original files for a later edition switch.
+        if light_path.is_file():
+            dest = backup / "game" / light_rel
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(light_path, dest)
+    for rel, data in payload.items():
+        write(game / rel, data, "game", rel)
+    print(f"    Installed {title} {version} with matching graphics")
+else:
+    print(f"    {title} {version} is already installed")
+if restore_light is not None:
+    write(light_path, restore_light, "game", light_rel)
+for rel, data in pending_cfg.items():
+    write(documents / "cfg" / rel, data, "cfg", rel)
+if edition == "Essential":
+    # Essential uses this directory to detect first launch; prevent its initial
+    # automatic placement from replacing the positions written above.
+    (documents / app_name).mkdir(parents=True, exist_ok=True)
+state.update(edition=edition, version=version, payload_revision=payload_revision,
+             fingerprint=fingerprint, configured=True, game=str(game.resolve()))
+if backup.exists():
+    state["last_backup"] = str(backup)
+    print("    Backup: " + str(backup))
+state_file.parent.mkdir(parents=True, exist_ok=True)
+fd, temp = tempfile.mkstemp(prefix=".cmrt-state-", dir=state_file.parent)
+try:
+    with os.fdopen(fd, "w") as f:
+        json.dump(state, f, indent=2)
+        f.write("\n")
+    os.replace(temp, state_file)
+finally:
+    if os.path.exists(temp):
+        os.unlink(temp)
+PY_HUD
+}
+
+# A paid download takes precedence over an old free download. Multiple copies
+# of the selected edition still require an explicit path, never a guessed version.
+detect_hud_archive() { # downloads directory
+  local downloads_dir="$1" candidate
+  local -a hud_candidates=() complete_candidates=()
+  while IFS= read -r -d '' candidate; do
+    case "${candidate,,}" in
+      */cmrt_complete_hud*.zip) complete_candidates+=("$candidate") ;;
+      */cmrt_essential_hud*.zip) hud_candidates+=("$candidate") ;;
+    esac
+  done < <(find "$downloads_dir" -maxdepth 1 -type f -print0 2> /dev/null)
+  if (( ${#complete_candidates[@]} > 0 )); then
+    hud_candidates=("${complete_candidates[@]}")
+  elif [[ -d "$AC_COMMON/apps/lua/CMRT-Complete-HUD" ]]; then
+    info "Keeping installed Complete HUD; use --hud ZIP to switch to Essential."
+    return
+  fi
+  if (( ${#hud_candidates[@]} == 1 )); then
+    HUD_ARCHIVE="${hud_candidates[0]}"
+  elif (( ${#hud_candidates[@]} > 1 )); then
+    die "multiple CMRT HUD archives found for this edition; select one with --hud ZIP or use --no-hud"
+  fi
+}
+
+if [[ "$HUD_MODE" == auto ]]; then
+  downloads_dir="$(xdg-user-dir DOWNLOAD 2> /dev/null || true)"
+  detect_hud_archive "${downloads_dir:-$HOME/Downloads}"
+fi
+if [[ -n "$HUD_ARCHIVE" ]]; then
+  step "Checking your local HUD archive"
+  hud_setup check
+fi
+
 
 # ------------------------------------------------------------ plugin cache --
 
@@ -966,6 +1402,13 @@ if [[ -n "$PURE_ARCHIVE" ]]; then
   pure_setup install
 elif [[ "$PURE_MODE" != skip ]]; then
   info "No local Pure 3.59 ZIP found; use --pure ZIP to install one."
+fi
+
+if [[ -n "$HUD_ARCHIVE" ]]; then
+  step "CMRT HUD from your local download"
+  hud_setup install
+elif [[ "$HUD_MODE" != skip ]]; then
+  info "No local CMRT HUD ZIP found; use --hud ZIP to install one."
 fi
 
 # ----------------------------------------------------------- desktop entry --

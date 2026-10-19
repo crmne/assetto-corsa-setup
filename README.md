@@ -35,7 +35,9 @@ time; it only changes what is missing or wrong.
    Microsoft's open-source Segoe UI stand-in, in its place, and turns on font
    smoothing. It also sets Content Manager's interface scale to your display's
    (see below).
-9. Points the Assetto Corsa desktop entry at Steam and registers it for
+9. If you have a local Pure 3.59 ZIP, installs it and selects a natural SDR
+   preset with Pure LCS weather and the matching Pure post-processing filter.
+10. Points the Assetto Corsa desktop entry at Steam and registers it for
    `acmanager://` links.
 
 Then start Assetto Corsa from Steam and it opens Content Manager.
@@ -48,10 +50,48 @@ Then start Assetto Corsa from Steam and it opens Content Manager.
 | `--proton TAG` | GE-Proton release to use, such as `GE-Proton11-7`, or `latest`. Switching rebuilds the prefix, keeping settings. |
 | `--scale N` | Content Manager's interface scale, such as `1.5`. Overrides whatever is set. |
 | `--no-csp` | Skip Custom Shaders Patch. |
+| `--pure ZIP` | Install your downloaded Pure 3.59 ZIP and apply the natural SDR preset once. |
+| `--no-pure` | Skip automatic Pure detection and installation. |
 | `--ac-path DIR` | Path to `steamapps/common/assettocorsa`, if it is not found. |
 
 `CSP_VERSION=0.2.x` installs that Custom Shaders Patch version over the
 installed one.
+
+## Pure 3.59
+
+Pure is optional and must be obtained separately. This project does not
+distribute Pure, purchase links, or download URLs. If exactly one
+`Pure 3.59*.zip` is in your Downloads directory, the script detects it
+automatically. Otherwise, select the original archive explicitly:
+
+```sh
+./assetto-corsa-setup --pure "$HOME/Downloads/Pure 3.59 Highres.zip"
+```
+
+Keep the ZIP intact, including its `Pure 3.59` folder. The installer verifies
+the version, checks file integrity before changing the game, and requires
+Custom Shaders Patch 0.2.3-preview211 or newer. The default CSP 0.2.11 meets
+that requirement. Pure's Windows installer and uninstallers are not run.
+
+The first installation enables Pure LCS, the static Pure controller (which
+works with ordinary races and career events), and the matching `pure`
+post-processing filter. It uses normal SDR output, exposure 1, 16x anisotropic
+filtering, and disables depth of field. New Pure app settings use subtle
+photo-realistic and soft-look values of 0.25, exposure uplift 0.10, and no
+speed-related depth of field. Existing Pure app preferences are kept.
+
+Resolution, refresh rate, wheel bindings, and other game preferences are
+preserved. Later runs keep your graphics adjustments and skip copying the
+same Pure archive again. To reinstall missing required components, run the
+same command. Use `--no-pure` to skip this step entirely.
+
+Replaced files and configuration are backed up under
+`~/.local/share/assetto-corsa-setup/backups/pure-3.59-*` (or
+`$XDG_DATA_HOME/assetto-corsa-setup/backups`). Each backup contains `game/`
+and `cfg/` files to restore to the game folder and the Assetto Corsa Documents
+configuration folder, respectively; `new-files.txt` records added files.
+The installer prints the exact backup path. Highres needs about 5 GB for
+the installed files plus temporary space for extraction and any backup.
 
 ## Interface scale
 
@@ -80,6 +120,21 @@ Content Manager crash on startup. The script removes it if it finds one.
 Arch Linux (Omarchy), native Steam, NVIDIA RTX 3090, GE-Proton9-20 and
 GE-Proton11-7, Content Manager 0.8.2895, Custom Shaders Patch 0.2.11: from a
 fresh install to a quick race and a clean exit.
+
+Pure 3.59 Highres with Pure LCS and the SDR preset was also checked in a
+running race on this setup. HDR output and other Pure versions are not tested.
+
+
+## Development checks
+
+```sh
+bash -n assetto-corsa-setup
+python3 -m unittest discover -s tests -v
+```
+
+The Pure regression tests use synthetic ZIP files and require no mod
+assets or game installation. They cover installation, backups, preserving
+settings and layouts, repeat runs, unsupported versions, and malformed archives.
 
 ## Requirements
 

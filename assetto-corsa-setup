@@ -25,6 +25,8 @@ FRESH=0
 SCALE=""
 INSTALL_CSP=1
 AC_COMMON=""
+PURE_ARCHIVE=""
+PURE_MODE=auto
 
 if [[ -t 1 ]]; then
   bold=$'\033[1m'; yellow=$'\033[33m'; red=$'\033[1;31m'; reset=$'\033[0m'
@@ -58,6 +60,9 @@ Options:
   --fresh          delete the Wine prefix and rebuild it (game settings, Content
                    Manager settings, presets and plugins are kept)
   --no-csp         do not install Custom Shaders Patch
+  --pure ZIP       install your locally downloaded Pure 3.59 ZIP and a natural
+                   SDR preset (default: detect Pure 3.59*.zip in Downloads)
+  --no-pure        skip local Pure detection and installation
   --proton TAG     GE-Proton release to use: a tag such as GE-Proton11-7, or
                    "latest" (default $PROTON_DEFAULT). Switching rebuilds the
                    Wine prefix, keeping settings as --fresh does.
@@ -78,6 +83,8 @@ while (( $# )); do
   case "$1" in
     --fresh) FRESH=1 ;;
     --no-csp) INSTALL_CSP=0 ;;
+    --pure) [[ $# -ge 2 && -f "$2" ]] || die "--pure needs a local Pure 3.59 ZIP"; PURE_ARCHIVE="$2"; PURE_MODE=explicit; shift ;;
+    --no-pure) PURE_MODE=skip; PURE_ARCHIVE="" ;;
     --proton) [[ $# -ge 2 ]] || die "--proton needs a release tag or latest"; PROTON="$2"; shift ;;
     --scale) [[ $# -ge 2 && "$2" =~ ^[0-9]+(\.[0-9]+)?$ ]] || die "--scale needs a number such as 1.5"; SCALE="$2"; shift ;;
     --ac-path) [[ $# -ge 2 ]] || die "--ac-path needs a directory"; AC_COMMON="${2%/}"; shift ;;
@@ -93,7 +100,8 @@ for bin in curl tar unzip python3 sha512sum pgrep; do
   command -v "$bin" > /dev/null || die "$bin is not installed"
 done
 
-TMP="$(mktemp -d)"
+mkdir -p "$CACHE_DIR"
+TMP="$(mktemp -d "$CACHE_DIR/setup-XXXXXXXX")"
 trap 'rm -rf "$TMP"' EXIT
 
 download() { # url destination
@@ -207,6 +215,227 @@ stop_steam() {
 
 if game_session_running || [[ -n "$(launcher_pids)" ]] || pgrep -f '\\acs(_x86)?\.exe' > /dev/null; then
   die "Assetto Corsa or Content Manager is running; close it and run this again"
+fi
+
+# --------------------------------------------------------------- local Pure --
+
+# Pure is supplied by the user. No Pure files or download URLs are distributed.
+pure_setup() { # check | install
+  python3 - "$1" "$PURE_ARCHIVE" "$AC_COMMON" "$AC_DOCS" "$CACHE_DIR" <<'PY_PURE'
+import configparser
+import hashlib
+import json
+import os
+from pathlib import Path, PurePosixPath
+import re
+import shutil
+import stat
+import sys
+import tempfile
+from datetime import datetime
+import zipfile
+
+mode, archive, game, documents, cache = sys.argv[1:]
+game, documents, cache = map(Path, (game, documents, cache))
+root_name = "Pure 3.59"
+required = (
+    "extension/weather/Pure LCS/manifest.ini",
+    "extension/weather/pure/manifest.ini",
+    "extension/weather/Pure LCS/weather.lua",
+    "extension/weather-controllers/pureCtrl static/controller.lua",
+    "system/cfg/ppfilters/pure.ini",
+    "system/cfg/ppfilters/purelcs_scripts/pure.lua",
+    "apps/lua/PureConfig/manifest.ini",
+)
+
+def ini(path):
+    result = configparser.ConfigParser(interpolation=None, strict=False)
+    result.optionxform = str
+    if path.exists():
+        result.read(path, encoding="utf-8-sig")
+    return result
+
+def atomic_text(path, text):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, name = tempfile.mkstemp(prefix=".pure-", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w") as out:
+            out.write(text)
+        os.replace(name, path)
+    finally:
+        if os.path.exists(name):
+            os.unlink(name)
+
+with zipfile.ZipFile(archive) as bundle:
+    entries, seen = [], set()
+    for member in bundle.infolist():
+        name = member.filename
+        parts = PurePosixPath(name).parts
+        if (not parts or name.startswith("/") or "\\" in name or ".." in parts
+                or any(":" in part for part in parts)
+                or stat.S_ISLNK(member.external_attr >> 16) or member.flag_bits & 1):
+            raise SystemExit("Pure archive contains an unsafe or encrypted entry")
+        if member.is_dir() or parts[0] != root_name:
+            continue
+        rel = PurePosixPath(*parts[1:])
+        if str(rel).casefold() in seen:
+            raise SystemExit("Pure archive contains duplicate paths")
+        seen.add(str(rel).casefold())
+        if not rel.parts or rel.parts[0] not in {
+            "apps", "content", "extension", "system", "_LICENSE and COPYRIGHT.txt", "description.jsgme"
+        }:
+            continue
+        destination = game / rel
+        if not destination.resolve().is_relative_to(game.resolve()) or destination.is_symlink():
+            raise SystemExit("Pure destination escapes the game directory")
+        entries.append((member, rel))
+    paths = {str(rel) for _, rel in entries}
+    if not set(required).issubset(paths):
+        raise SystemExit("Expected the original Pure 3.59 ZIP, containing the Pure 3.59 folder")
+    for rel in required[:2]:
+        manifest = configparser.ConfigParser(interpolation=None)
+        manifest.read_string(bundle.read(root_name + "/" + rel).decode("utf-8-sig"))
+        if manifest.get("ABOUT", "VERSION", fallback="").strip() != "3.59":
+            raise SystemExit("Only Pure 3.59 archives are supported")
+    if not re.search(rb"__PURE_version\s*=\s*3\.59(?:\s|$)", bundle.read(root_name + "/" + required[2])):
+        raise SystemExit("Pure lighting script version does not match 3.59")
+    fingerprint = hashlib.sha256(json.dumps([
+        (str(rel), member.file_size, member.CRC) for member, rel in entries
+    ], sort_keys=True).encode()).hexdigest()
+    if mode == "check":
+        print("    Verified local Pure 3.59 archive layout and version")
+        sys.exit(0)
+    if mode != "install":
+        raise SystemExit("Unknown Pure operation")
+    csp_manifest = game / "extension/config/data_manifest.ini"
+    if not (game / "dwrite.dll").is_file() or not csp_manifest.is_file():
+        raise SystemExit("Pure needs Custom Shaders Patch; install CSP first")
+    # 0.2.3-preview211 is the minimum declared by Pure LCS 3.59.
+    csp = ini(csp_manifest)
+    try:
+        build = csp.getint("VERSION", "SHADERS_PATCH_BUILD")
+    except (ValueError, configparser.Error):
+        raise SystemExit("Cannot verify the installed CSP build for Pure")
+    if build < 2974:
+        raise SystemExit("Pure 3.59 needs CSP 0.2.3-preview211 or newer")
+    cache.mkdir(parents=True, exist_ok=True)
+    install_id = hashlib.sha256(str(game.resolve()).encode()).hexdigest()[:16]
+    state_file = cache / "pure" / (install_id + ".json")
+    state = json.loads(state_file.read_text()) if state_file.exists() else {}
+    complete = state.get("fingerprint") == fingerprint and all((game / rel).is_file() for rel in required)
+    backup = cache / "backups" / ("pure-3.59-" + datetime.now().strftime("%Y%m%d-%H%M%S-%f"))
+    backed_up = set()
+
+    def preserve(path, category, rel):
+        key = str(path)
+        if key in backed_up:
+            return
+        backed_up.add(key)
+        destination = backup / category / rel
+        if path.exists():
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(path, destination)
+        else:
+            backup.mkdir(parents=True, exist_ok=True)
+            with (backup / "new-files.txt").open("a") as record:
+                record.write(str(path) + "\n")
+
+    if not complete:
+        size = sum(member.file_size for member, _ in entries)
+        overwritten = sum((game / rel).stat().st_size for _, rel in entries if (game / rel).is_file())
+        cache_needed = size + overwritten + 256 * 1024**2
+        if cache.stat().st_dev == game.stat().st_dev:
+            cache_needed += size
+        if shutil.disk_usage(cache).free < cache_needed:
+            raise SystemExit("Not enough space to stage and back up Pure in the setup data directory")
+        if shutil.disk_usage(game).free < size + 256 * 1024**2:
+            raise SystemExit("Not enough space to install Pure in the game directory")
+        print("    Checking and staging Pure files (about 5 GB for Highres)...", flush=True)
+        with tempfile.TemporaryDirectory(prefix="pure-stage-", dir=cache) as temporary:
+            stage = Path(temporary)
+            # Validate CRCs for every installed file before changing the game.
+            for member, rel in entries:
+                target = stage / rel
+                target.parent.mkdir(parents=True, exist_ok=True)
+                with bundle.open(member) as source, target.open("wb") as out:
+                    shutil.copyfileobj(source, out, 1024 * 1024)
+            for _, rel in entries:
+                preserve(game / rel, "game", rel)
+            # Atomic replacement per file, with originals and new paths recorded.
+            for _, rel in entries:
+                target = game / rel
+                target.parent.mkdir(parents=True, exist_ok=True)
+                fd, temporary_file = tempfile.mkstemp(prefix=".pure-", dir=target.parent)
+                os.close(fd)
+                try:
+                    shutil.copyfile(stage / rel, temporary_file)
+                    os.chmod(temporary_file, 0o644)
+                    os.replace(temporary_file, target)
+                finally:
+                    if os.path.exists(temporary_file):
+                        os.unlink(temporary_file)
+        print("    Installed Pure 3.59; original files backed up")
+    else:
+        print("    Pure 3.59 is already installed")
+
+    first_setup = not state.get("configured")
+    def update_ini(path, category, rel, values, force=False):
+        import io
+        settings = ini(path)
+        changed = False
+        for section, pairs in values.items():
+            if not settings.has_section(section):
+                settings.add_section(section)
+            for key, value in pairs.items():
+                if (force or not settings.has_option(section, key)) and settings.get(section, key, fallback=None) != value:
+                    settings.set(section, key, value)
+                    changed = True
+        if changed:
+            preserve(path, category, rel)
+            out = io.StringIO()
+            settings.write(out, space_around_delimiters=False)
+            atomic_text(path, out.getvalue())
+
+    # Apply the SDR preset once; later runs keep the user's adjustments.
+    for rel, values in {
+        "video.ini": {"POST_PROCESS": {"ENABLED": "1", "FILTER": "pure", "DOF": "0", "FXAA": "1"},
+                      "VIDEO": {"ANISOTROPIC": "16"}},
+        "exposure.ini": {"EXPOSURE": {"VALUE": "1"}},
+        "extension/weather_fx.ini": {"BASIC": {"ENABLED": "1", "IMPLEMENTATION": "Pure LCS", "CONTROLLER": "pureCtrl static"}},
+        "extension/dxgi_tweaks.ini": {"HDR": {"ENABLED": "0"}},
+    }.items():
+        update_ini(documents / "cfg" / rel, "cfg", rel, values, force=first_setup)
+    rel = "extension/config-ext/Pure LCS/scriptsettings/pure_ScriptSettings.ini"
+    # Existing Pure app settings are personal; only fill in missing values.
+    update_ini(game / rel, "game", rel, {"PureScriptSettings": {
+        "script_version": "3.0", "photo-realistic": "0.25", "soft-look": "0.25",
+        "exposure-uplift": "0.10", "Activate%20speed-related%20DOF": "false",
+    }})
+    state.update(version="3.59", fingerprint=fingerprint, configured=True, game=str(game.resolve()))
+    if backup.exists():
+        state["last_backup"] = str(backup)
+        print("    Backup: " + str(backup))
+    atomic_text(state_file, json.dumps(state, indent=2) + "\n")
+    print("    Pure LCS + Pure filter configured for natural SDR lighting" if first_setup
+          else "    Existing graphics preferences preserved")
+PY_PURE
+}
+
+if [[ "$PURE_MODE" == auto ]]; then
+  downloads_dir="$(xdg-user-dir DOWNLOAD 2> /dev/null || true)"
+  downloads_dir="${downloads_dir:-$HOME/Downloads}"
+  shopt -s nullglob
+  pure_candidates=("$downloads_dir"/Pure\ 3.59*.zip)
+  shopt -u nullglob
+  if (( ${#pure_candidates[@]} == 1 )); then
+    PURE_ARCHIVE="${pure_candidates[0]}"
+  elif (( ${#pure_candidates[@]} > 1 )); then
+    die "multiple Pure 3.59 archives found; select one with --pure ZIP or use --no-pure"
+  fi
+fi
+if [[ -n "$PURE_ARCHIVE" ]]; then
+  step "Checking your local Pure archive"
+  pure_setup check
 fi
 
 # ------------------------------------------------------------ plugin cache --
@@ -729,6 +958,14 @@ EOF
     STEAM_DIR="$STEAM_DIR" protontricks "$APPID" fontsmooth=rgb > "$TMP/fontsmooth.log" 2>&1 \
       || { tail -n 20 "$TMP/fontsmooth.log" >&2; warn "could not turn on font smoothing"; }
   fi
+fi
+
+# Pure runs after prefix setup, when both CSP and the user's cfg directory exist.
+if [[ -n "$PURE_ARCHIVE" ]]; then
+  step "Pure 3.59 from your local download"
+  pure_setup install
+elif [[ "$PURE_MODE" != skip ]]; then
+  info "No local Pure 3.59 ZIP found; use --pure ZIP to install one."
 fi
 
 # ----------------------------------------------------------- desktop entry --

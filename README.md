@@ -43,6 +43,8 @@ time; it only changes what is missing or wrong.
    `acmanager://` links.
 12. Installs a small CSP background app for accurate MOZA rev lights, using
     the current car's actual RPM limit, including low-revving cars.
+13. If you have a local LFM App installer, installs it in AC's Proton prefix,
+    sets the game folder, and creates a launcher with Steam login callbacks.
 
 Then start Assetto Corsa from Steam and it opens Content Manager.
 
@@ -59,6 +61,8 @@ Then start Assetto Corsa from Steam and it opens Content Manager.
 | `--hud ZIP` | Install your downloaded CMRT Essential 1.0.13 or Complete 2.1.3 ZIP and arrange its apps once. |
 | `--no-hud` | Skip automatic HUD detection and installation. |
 | `--no-moza-telemetry` | Skip the CSP companion for accurate MOZA rev lights. |
+| `--lfm EXE` | Install your downloaded LFM App Setup 1.1.13.exe. |
+| `--no-lfm` | Skip automatic LFM detection and installation. |
 | `--ac-path DIR` | Path to `steamapps/common/assettocorsa`, if it is not found. |
 
 `CSP_VERSION=0.2.x` installs that Custom Shaders Patch version over the
@@ -167,6 +171,45 @@ preferences and existing visible layouts are preserved; later runs keep your
 positions and sizes. Default sizes are changed only in the local copy of
 CMRT's settings file, and saved preferences take precedence.
 
+## LFM App
+
+Download LFM App separately from Low Fuel Motorsport. If exactly one
+`LFM App Setup *.exe` is in Downloads, the script detects it. Version 1.1.13
+is supported; select a specific installer with:
+
+```sh
+./assetto-corsa-setup --lfm "$HOME/Downloads/LFM App Setup 1.1.13.exe"
+```
+
+This needs `7z` and native `protontricks`. The installer checks the archive and
+version, then extracts the unmodified application into AC's Proton prefix.
+This bypasses the Windows installer's PowerShell process check, which fails
+under Wine. No LFM files or account credentials are bundled with this project.
+
+Open **LFM App** from your application launcher and sign in with Steam once.
+The script registers `liverytool://` and `lfmhub://` browser callbacks and
+sets AC's game folder. Choose your series and content in LFM itself; the setup
+script does not register you for races or download every series' mods.
+
+The app lives under `AppData/Local/Programs/LFM App` in AC's prefix, with its
+profile in `AppData/Roaming/lfm-hub`. The launcher at `~/.local/bin/lfm-app`
+uses that prefix with `--no-sandbox --disable-gpu`, needed for Electron to open
+under this Proton configuration. These flags apply only to LFM App.
+The desktop entry is `~/.local/share/applications/lfm-app.desktop`.
+
+Reruns preserve login, preferences, and newer app versions installed by LFM's
+updater. Close LFM before repairing its application files or using `--fresh`.
+Prefix rebuilds keep both the app and its profile. Replaced files and settings
+are backed up under `~/.local/share/assetto-corsa-setup/backups/lfm-*`.
+`--no-lfm` skips installation without removing an existing app.
+
+LFM races can be selected and registered on the website. Registering directly
+inside the desktop app requires LFM+ (with an exception for LMU in app 1.1.13).
+Those locks do not mean ordinary website race sign-up requires a subscription.
+Follow the event's licence, content, and server-join
+instructions. Start the game through Steam as usual. An app login test does
+not establish that every game's multiplayer works under Proton.
+
 ## Interface scale
 
 On a HiDPI display Content Manager is tiny, because Wine draws X11 windows at
@@ -202,6 +245,10 @@ including readable text, live gauges, and matching flag/fuel assets. Complete's
 radar and damage display were checked with nearby cars. Other
 resolutions have automated layout checks but have not been checked in-game.
 
+LFM App 1.1.13 was opened under GE-Proton11-7 and its Steam sign-in/browser
+callback was verified. Series content sync and joining an LFM server have
+not yet been tested. This does not imply official Linux support from LFM.
+
 ## Development checks
 
 ```sh
@@ -212,6 +259,9 @@ python3 -m unittest discover -s tests -v
 The Pure and HUD regression tests use synthetic ZIP files and require no mod
 assets or game installation. They cover installation, backups, preserving
 settings and layouts, repeat runs, unsupported versions, and malformed archives.
+LFM tests use synthetic 7z/ASAR packages and require `7z`. They cover preserving
+login and preferences, prefix rebuilds, safe callbacks, repairs, and avoiding
+downgrades, without running vendor code or contacting LFM.
 
 ## Requirements
 

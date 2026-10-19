@@ -30,6 +30,8 @@ PURE_MODE=auto
 HUD_ARCHIVE=""
 HUD_MODE=auto
 INSTALL_MOZA_TELEMETRY=1
+LFM_INSTALLER=""
+LFM_MODE=auto
 
 if [[ -t 1 ]]; then
   bold=$'\033[1m'; yellow=$'\033[33m'; red=$'\033[1;31m'; reset=$'\033[0m'
@@ -70,6 +72,9 @@ Options:
                    (default: detect Downloads, preferring Complete)
   --no-hud         skip local HUD detection and installation
   --no-moza-telemetry  skip the CSP app that sends exact RPM limits to MOZA
+  --lfm EXE        install your downloaded LFM App Setup 1.1.13.exe in AC's
+                   Proton prefix (default: detect it in Downloads)
+  --no-lfm         skip LFM detection and installation
   --proton TAG     GE-Proton release to use: a tag such as GE-Proton11-7, or
                    "latest" (default $PROTON_DEFAULT). Switching rebuilds the
                    Wine prefix, keeping settings as --fresh does.
@@ -95,6 +100,8 @@ while (( $# )); do
     --hud) [[ $# -ge 2 && -f "$2" ]] || die "--hud needs a local CMRT Essential or Complete HUD ZIP"; HUD_ARCHIVE="$2"; HUD_MODE=explicit; shift ;;
     --no-hud) HUD_MODE=skip; HUD_ARCHIVE="" ;;
     --no-moza-telemetry) INSTALL_MOZA_TELEMETRY=0 ;;
+    --lfm) [[ $# -ge 2 && -f "$2" ]] || die "--lfm needs a local LFM App Setup EXE"; LFM_INSTALLER="$2"; LFM_MODE=explicit; shift ;;
+    --no-lfm) LFM_MODE=skip; LFM_INSTALLER="" ;;
     --proton) [[ $# -ge 2 ]] || die "--proton needs a release tag or latest"; PROTON="$2"; shift ;;
     --scale) [[ $# -ge 2 && "$2" =~ ^[0-9]+(\.[0-9]+)?$ ]] || die "--scale needs a number such as 1.5"; SCALE="$2"; shift ;;
     --ac-path) [[ $# -ge 2 ]] || die "--ac-path needs a directory"; AC_COMMON="${2%/}"; shift ;;
@@ -179,6 +186,8 @@ PFX="$COMPATDATA/pfx"
 WIN_USER="$PFX/drive_c/users/steamuser"
 AC_DOCS="$WIN_USER/Documents/Assetto Corsa"
 CM_DATA="$WIN_USER/AppData/Local/AcTools Content Manager"
+LFM_DATA="$WIN_USER/AppData/Roaming/lfm-hub"
+LFM_APP="$WIN_USER/AppData/Local/Programs/LFM App"
 CONFIG_BACKUP="$STEAMAPPS/compatdata/$APPID.assetto-corsa-setup"
 READY_MARKER="$COMPATDATA/.assetto-corsa-setup-ready"
 COMPAT_TOOLS_DIR="$STEAM_DIR/compatibilitytools.d"
@@ -877,6 +886,212 @@ if [[ -n "$HUD_ARCHIVE" ]]; then
 fi
 
 
+# --------------------------------------------------------------- local LFM --
+
+lfm_setup() { # check | install
+  python3 - "$1" "$LFM_INSTALLER" "$AC_COMMON" "$PFX" "$CACHE_DIR" "$STEAM_DIR" <<'PY_LFM'
+from datetime import datetime
+from pathlib import Path, PureWindowsPath
+import hashlib
+import json
+import os
+import re
+import shlex
+import shutil
+import struct
+import subprocess
+import sys
+import tempfile
+
+mode, archive, game, prefix, cache, steam = sys.argv[1:]
+game, prefix, cache = map(Path, (game, prefix, cache))
+if not shutil.which("7z") or not shutil.which("protontricks"):
+    raise SystemExit("LFM installation needs 7z and native protontricks (not Flatpak).")
+
+def run(*args):
+    return subprocess.run(args, check=True, capture_output=True).stdout
+
+def package(asar):
+    with asar.open("rb") as f:
+        _, header_size, _, json_size = struct.unpack("<4I", f.read(16))
+        if not 0 < json_size < header_size < 32 * 1024 * 1024:
+            raise ValueError("invalid ASAR header")
+        header = json.loads(f.read(json_size))
+        entry = header["files"]["package.json"]
+        if not 0 < entry["size"] < 1024 * 1024 or int(entry["offset"]) < 0:
+            raise ValueError("invalid package metadata")
+        f.seek(8 + header_size + int(entry["offset"]))
+        return json.loads(f.read(entry["size"]))
+
+def safe_listing(listing):
+    entries = listing.split("----------\n", 1)[1].strip().split("\n\n")
+    names, total = set(), 0
+    for block in entries:
+        fields = dict(line.split(" = ", 1) for line in block.splitlines() if " = " in line)
+        name = fields.get("Path", "")
+        path = PureWindowsPath(name)
+        if (not name or path.is_absolute() or path.drive or path.root or ".." in path.parts
+                or ":" in name or any(c in name for c in "\r\n\x00")
+                or fields.get("Symbolic Link") or fields.get("Hard Link")
+                or "l" in fields.get("Attributes", "")):
+            raise ValueError("unsafe LFM archive member")
+        key = str(path).casefold()
+        if key in names:
+            raise ValueError("duplicate LFM archive member")
+        names.add(key)
+        total += int(fields.get("Size", "0"))
+    if total > 1024**3 or len(names) > 20000:
+        raise ValueError("unexpected LFM payload size")
+
+app = prefix / "drive_c/users/steamuser/AppData/Local/Programs/LFM App"
+config = prefix / "drive_c/users/steamuser/AppData/Roaming/lfm-hub/config.json"
+backup = cache / "backups" / ("lfm-" + datetime.now().strftime("%Y%m%d-%H%M%S-%f"))
+for dest in (app, config):
+    if dest.is_symlink() or not dest.resolve().is_relative_to(prefix.resolve()):
+        raise SystemExit("LFM destination escapes the Proton prefix")
+try:
+    settings = json.loads(config.read_text()) if config.exists() else {}
+    if not isinstance(settings, dict):
+        raise ValueError("expected an object")
+except (ValueError, OSError):
+    raise SystemExit("LFM settings could not be read; existing files were not modified.")
+
+cache.mkdir(parents=True, exist_ok=True)
+with tempfile.TemporaryDirectory(prefix="lfm-", dir=cache) as scratch:
+    scratch = Path(scratch)
+    payload = scratch / "app-64.7z"
+    with payload.open("wb") as f:
+        subprocess.run(["7z", "x", "-so", archive, "$PLUGINSDIR/app-64.7z"],
+                       stdout=f, stderr=subprocess.PIPE, check=True)
+    if not payload.stat().st_size:
+        raise SystemExit("This is not a supported LFM App installer.")
+    safe_listing(run("7z", "l", "-slt", str(payload)).decode().replace("\r\n", "\n"))
+    run("7z", "t", str(payload))
+    stage = scratch / "app"
+    run("7z", "x", "-y", "-o" + str(stage), str(payload))
+    for rel in ("LFM App.exe", "resources/app.asar", "resources/assets/icon.png"):
+        if not (stage / rel).is_file():
+            raise SystemExit("LFM payload is missing " + rel)
+    meta = package(stage / "resources/app.asar")
+    if meta.get("name") != "lfm-hub" or meta.get("version") != "1.1.13":
+        raise SystemExit("Supported LFM installer: version 1.1.13. Other versions need validation first.")
+    newer_installed = False
+    if (app / "resources/app.asar").is_file():
+        try:
+            installed = package(app / "resources/app.asar")
+            version = installed.get("version", "")
+            newer_installed = (installed.get("name") == "lfm-hub"
+                               and re.fullmatch(r"\d+\.\d+\.\d+", version) is not None
+                               and tuple(map(int, version.split("."))) > (1, 1, 13))
+        except (ValueError, OSError, KeyError, TypeError, struct.error):
+            pass  # An incomplete installation can be repaired below.
+    if mode == "check":
+        print("    LFM App 1.1.13 payload and file integrity verified.")
+        raise SystemExit(0)
+
+    def digest(path):
+        with path.open("rb") as f:
+            return hashlib.file_digest(f, "sha256").hexdigest()
+
+    # Compare all files, so a partial installation is repaired, and an identical
+    # running copy is left alone. Never patch the vendor's application code.
+    identical = newer_installed or (app.is_dir() and all(
+        (app / p.relative_to(stage)).is_file()
+        and digest(p) == digest(app / p.relative_to(stage))
+        for p in stage.rglob("*") if p.is_file()))
+    if not identical:
+        if subprocess.run(["pgrep", "-f", r"^[A-Za-z]:\\.*\\LFM App\\LFM App\.exe"],
+                          stdout=subprocess.DEVNULL).returncode == 0:
+            raise SystemExit("Close LFM App before installing or repairing its files.")
+        if app.exists():
+            backup.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(app), backup / "app")
+        app.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            shutil.copytree(stage, app)
+        except Exception:
+            shutil.rmtree(app, ignore_errors=True)
+            if (backup / "app").exists():
+                shutil.move(str(backup / "app"), app)
+            raise
+
+    win_game = "Z:" + str(game.resolve()).replace("/", "\\")
+    if settings.get("acSteamPath") != win_game or settings.get("acSteamPathLocked") is not True:
+        if config.exists():
+            backup.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(config, backup / "config.json")
+            (backup / "config.json").chmod(0o600)
+        settings.update(acSteamPath=win_game, acSteamPathLocked=True)
+        config.parent.mkdir(parents=True, exist_ok=True)
+        temp = config.with_suffix(".setup-new")
+        temp.write_text(json.dumps(settings, indent=2) + "\n")
+        temp.chmod(0o600)
+        temp.replace(config)
+
+    launcher = Path.home() / ".local/bin/lfm-app"
+    launcher.parent.mkdir(parents=True, exist_ok=True)
+    # argv is shell-quoted for protontricks, including browser callback URLs.
+    launcher.write_text('''#!/usr/bin/env python3
+import os
+import shlex
+import subprocess
+import sys
+from urllib.parse import urlsplit
+
+args = sys.argv[1:]
+if len(args) > 1 or (args and urlsplit(args[0]).scheme not in ("liverytool", "lfmhub")):
+    raise SystemExit("LFM accepts only a liverytool:// or lfmhub:// link.")
+env = os.environ.copy()
+env["STEAM_DIR"] = ''' + repr(steam) + '''
+env["WINEDEBUG"] = "-all"
+command = ["wine", r"C:\\users\\steamuser\\AppData\\Local\\Programs\\LFM App\\LFM App.exe",
+           "--no-sandbox", "--disable-gpu", *args]
+# LFM prints authentication callbacks. Do not retain those in launcher logs.
+result = subprocess.run(["protontricks", "-c", shlex.join(command), "244210"],
+                        env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+raise SystemExit(result.returncode)
+''')
+    launcher.chmod(0o755)
+
+    def desktop_quote(value):
+        return '"' + str(value).replace("\\", "\\\\").replace('"', '\\"').replace("`", "\\`").replace("$", "\\$").replace("%", "%%") + '"'
+
+    desktop = Path.home() / ".local/share/applications/lfm-app.desktop"
+    desktop.parent.mkdir(parents=True, exist_ok=True)
+    desktop.write_text("\n".join([
+        "[Desktop Entry]", "Type=Application", "Name=LFM App",
+        "Comment=Low Fuel Motorsport for Assetto Corsa",
+        "Exec=" + desktop_quote(launcher) + " %u",
+        "Icon=" + str(app / "resources/assets/icon.png"),
+        "Terminal=false", "Categories=Game;",
+        "MimeType=x-scheme-handler/liverytool;x-scheme-handler/lfmhub;", ""]))
+    if shutil.which("xdg-mime"):
+        for scheme in ("liverytool", "lfmhub"):
+            run("xdg-mime", "default", desktop.name, "x-scheme-handler/" + scheme)
+    if shutil.which("update-desktop-database"):
+        run("update-desktop-database", str(desktop.parent))
+    print("    Keeping the newer installed LFM App." if newer_installed else
+          "    LFM App 1.1.13 installed. Launch LFM App and log in with Steam.")
+    print("    AC path configured; browser login links return to LFM App.")
+    if backup.exists():
+        print(f"    Previous LFM files/settings backed up in {backup}")
+PY_LFM
+}
+
+if [[ "$LFM_MODE" == auto ]]; then
+  downloads_dir="$(xdg-user-dir DOWNLOAD 2> /dev/null || true)"
+  mapfile -d '' lfm_candidates < <(find "${downloads_dir:-$HOME/Downloads}" -maxdepth 1 -type f -iname 'LFM App Setup *.exe' -print0 2> /dev/null)
+  if (( ${#lfm_candidates[@]} == 1 )); then
+    LFM_INSTALLER="${lfm_candidates[0]}"
+  elif (( ${#lfm_candidates[@]} > 1 )); then
+    die "multiple LFM installers found; select one with --lfm EXE or use --no-lfm"
+  fi
+fi
+if [[ -n "$LFM_INSTALLER" ]]; then
+  step "Checking your local LFM installer"
+  lfm_setup check
+fi
+
 # ------------------------------------------------------------ plugin cache --
 
 # Content Manager only hands out its plugins to itself, so whatever it has
@@ -1075,15 +1290,31 @@ restore_config_backup() {
     mkdir -p "$(dirname "$CM_DATA")"
     mv "$CONFIG_BACKUP/AcTools Content Manager" "$CM_DATA"
   fi
+  if [[ -d "$CONFIG_BACKUP/lfm-hub" && ! -e "$LFM_DATA" ]]; then
+    mkdir -p "$(dirname "$LFM_DATA")"
+    mv "$CONFIG_BACKUP/lfm-hub" "$LFM_DATA"
+  fi
+  if [[ -d "$CONFIG_BACKUP/LFM App" && ! -e "$LFM_APP" ]]; then
+    mkdir -p "$(dirname "$LFM_APP")"
+    mv "$CONFIG_BACKUP/LFM App" "$LFM_APP"
+  fi
   rmdir "$CONFIG_BACKUP" 2> /dev/null \
     || warn "older settings were left in $CONFIG_BACKUP because newer ones exist"
 }
 
 if (( FRESH )) && [[ -d "$COMPATDATA" ]]; then
+  pgrep -f '^[A-Za-z]:\\.*\\LFM App\\LFM App\.exe' > /dev/null \
+    && die "Close LFM App before rebuilding its Proton prefix"
+  for saved in "Assetto Corsa" "AcTools Content Manager" lfm-hub "LFM App"; do
+    [[ ! -e "$CONFIG_BACKUP/$saved" ]] \
+      || die "Recover the previous settings backup at $CONFIG_BACKUP before rebuilding the prefix"
+  done
   step "Rebuilding the Wine prefix (keeping settings, presets and plugins)"
   mkdir -p "$CONFIG_BACKUP"
   [[ ! -d "$AC_DOCS" || -e "$CONFIG_BACKUP/Assetto Corsa" ]] || mv "$AC_DOCS" "$CONFIG_BACKUP/"
   [[ ! -d "$CM_DATA" || -e "$CONFIG_BACKUP/AcTools Content Manager" ]] || mv "$CM_DATA" "$CONFIG_BACKUP/"
+  [[ ! -d "$LFM_DATA" || -e "$CONFIG_BACKUP/lfm-hub" ]] || mv "$LFM_DATA" "$CONFIG_BACKUP/"
+  [[ ! -d "$LFM_APP" || -e "$CONFIG_BACKUP/LFM App" ]] || mv "$LFM_APP" "$CONFIG_BACKUP/"
   rm -rf "$COMPATDATA"
 fi
 restore_config_backup
@@ -1489,6 +1720,13 @@ PY_MOZA
 if (( INSTALL_MOZA_TELEMETRY )); then
   step "MOZA rev lights: actual Assetto Corsa RPM limit"
   moza_telemetry_setup
+fi
+
+if [[ -n "$LFM_INSTALLER" ]]; then
+  step "LFM App from your local download"
+  lfm_setup install
+elif [[ "$LFM_MODE" != skip ]]; then
+  info "No local LFM installer found; use --lfm EXE to install it."
 fi
 
 # ----------------------------------------------------------- desktop entry --

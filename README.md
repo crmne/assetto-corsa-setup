@@ -45,6 +45,8 @@ time; it only changes what is missing or wrong.
     the current car's actual RPM limit, including low-revving cars.
 13. If you have a local LFM App installer, installs it in AC's Proton prefix,
     sets the game folder, and creates a launcher with Steam login callbacks.
+14. If you have the local TheTenths 1.10.98 client, installs it in the same
+    prefix so it can read AC's shared-memory telemetry, and creates a launcher.
 
 Then start Assetto Corsa from Steam and it opens Content Manager.
 
@@ -63,6 +65,8 @@ Then start Assetto Corsa from Steam and it opens Content Manager.
 | `--no-moza-telemetry` | Skip the CSP companion for accurate MOZA rev lights. |
 | `--lfm EXE` | Install your downloaded LFM App Setup 1.1.13.exe. |
 | `--no-lfm` | Skip automatic LFM detection and installation. |
+| `--coach EXE` | Install your downloaded TheTenths client 1.10.98. |
+| `--no-coach` | Skip automatic TheTenths detection and installation. |
 | `--ac-path DIR` | Path to `steamapps/common/assettocorsa`, if it is not found. |
 
 `CSP_VERSION=0.2.x` installs that Custom Shaders Patch version over the
@@ -210,6 +214,42 @@ Follow the event's licence, content, and server-join
 instructions. Start the game through Steam as usual. An app login test does
 not establish that every game's multiplayer works under Proton.
 
+## TheTenths Coach
+
+Download the Windows client from [TheTenths](https://www.thetenths.com/client)
+separately. The setup script detects a single `thetenths-client*.exe` in
+Downloads, or accepts an explicit path:
+
+```sh
+./assetto-corsa-setup --coach "$HOME/Downloads/thetenths-client.exe"
+```
+
+This currently accepts the exact 1.10.98 build tested here, identified by
+SHA-256. This identifies the tested file, not a publisher signature. Other
+builds require validation; use `--no-coach` to continue setup without them.
+No vendor executable is bundled or downloaded by this project.
+
+Open **TheTenths Coach** from the application launcher, or run `thetenths`.
+Click **Link this PC** and sign in or create an account in your browser.
+Press **Start** if the client has not started automatically, then launch
+Assetto Corsa normally. The launcher uses AC's Proton prefix, allowing the
+coach to read the same Windows shared-memory telemetry as the game. No game
+mod is needed for the coach. Its account link and settings save automatically.
+
+The free client provides live voice coaching and lap telemetry. Generated
+AI briefings/analysis use account credits; consult the vendor for current
+credit terms. Valid laps and telemetry are sent to TheTenths, and lap pages
+are public. This differs from the MOZA companion's local-only telemetry.
+
+The app is installed in `AppData/Local/Programs/TheTenths`, with its account,
+preferences and logs in `AppData/Roaming/TheTenths`, inside AC's prefix.
+Reruns leave that profile unchanged. Automatic installation preserves a
+different installed build, such as a vendor update; `--coach EXE` explicitly
+replaces it after backing up the executable. Close the coach before replacing
+it or rebuilding the prefix. `--fresh` preserves both directories.
+The launcher does not capture application output or authentication data.
+`--no-coach` skips installation without removing anything.
+
 ## Interface scale
 
 On a HiDPI display Content Manager is tiny, because Wine draws X11 windows at
@@ -248,6 +288,11 @@ resolutions have automated layout checks but have not been checked in-game.
 LFM App 1.1.13 was opened under GE-Proton11-7 and its Steam sign-in/browser
 callback was verified. Series content sync and joining an LFM server have
 not yet been tested. This does not imply official Linux support from LFM.
+
+TheTenths 1.10.98 was opened and linked under GE-Proton11-7. It received live
+Mazda MX-5 Cup telemetry at Mugello and generated corner-specific coaching
+from a downloaded reference lap. Other games and prefixes have not been
+tested with this launcher.
 
 ## Development checks
 

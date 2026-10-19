@@ -32,6 +32,8 @@ HUD_MODE=auto
 INSTALL_MOZA_TELEMETRY=1
 LFM_INSTALLER=""
 LFM_MODE=auto
+COACH_EXE=""
+COACH_MODE=auto
 
 if [[ -t 1 ]]; then
   bold=$'\033[1m'; yellow=$'\033[33m'; red=$'\033[1;31m'; reset=$'\033[0m'
@@ -75,6 +77,9 @@ Options:
   --lfm EXE        install your downloaded LFM App Setup 1.1.13.exe in AC's
                    Proton prefix (default: detect it in Downloads)
   --no-lfm         skip LFM detection and installation
+  --coach EXE      install your downloaded TheTenths client 1.10.98 in AC's
+                   Proton prefix (default: detect thetenths-client.exe in Downloads)
+  --no-coach       skip TheTenths detection and installation
   --proton TAG     GE-Proton release to use: a tag such as GE-Proton11-7, or
                    "latest" (default $PROTON_DEFAULT). Switching rebuilds the
                    Wine prefix, keeping settings as --fresh does.
@@ -102,6 +107,8 @@ while (( $# )); do
     --no-moza-telemetry) INSTALL_MOZA_TELEMETRY=0 ;;
     --lfm) [[ $# -ge 2 && -f "$2" ]] || die "--lfm needs a local LFM App Setup EXE"; LFM_INSTALLER="$2"; LFM_MODE=explicit; shift ;;
     --no-lfm) LFM_MODE=skip; LFM_INSTALLER="" ;;
+    --coach) [[ $# -ge 2 && -f "$2" ]] || die "--coach needs a local TheTenths client EXE"; COACH_EXE="$2"; COACH_MODE=explicit; shift ;;
+    --no-coach) COACH_MODE=skip; COACH_EXE="" ;;
     --proton) [[ $# -ge 2 ]] || die "--proton needs a release tag or latest"; PROTON="$2"; shift ;;
     --scale) [[ $# -ge 2 && "$2" =~ ^[0-9]+(\.[0-9]+)?$ ]] || die "--scale needs a number such as 1.5"; SCALE="$2"; shift ;;
     --ac-path) [[ $# -ge 2 ]] || die "--ac-path needs a directory"; AC_COMMON="${2%/}"; shift ;;
@@ -188,6 +195,8 @@ AC_DOCS="$WIN_USER/Documents/Assetto Corsa"
 CM_DATA="$WIN_USER/AppData/Local/AcTools Content Manager"
 LFM_DATA="$WIN_USER/AppData/Roaming/lfm-hub"
 LFM_APP="$WIN_USER/AppData/Local/Programs/LFM App"
+COACH_DATA="$WIN_USER/AppData/Roaming/TheTenths"
+COACH_APP="$WIN_USER/AppData/Local/Programs/TheTenths"
 CONFIG_BACKUP="$STEAMAPPS/compatdata/$APPID.assetto-corsa-setup"
 READY_MARKER="$COMPATDATA/.assetto-corsa-setup-ready"
 COMPAT_TOOLS_DIR="$STEAM_DIR/compatibilitytools.d"
@@ -886,6 +895,114 @@ if [[ -n "$HUD_ARCHIVE" ]]; then
 fi
 
 
+# --------------------------------------------------------- local TheTenths --
+
+coach_setup() { # check | install
+  python3 - "$1" "$COACH_EXE" "$PFX" "$CACHE_DIR" "$STEAM_DIR" "$COACH_MODE" <<'PY_COACH'
+import hashlib
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+import tempfile
+from datetime import datetime
+
+mode, source, prefix, cache, steam, selection = sys.argv[1:]
+source, prefix, cache = Path(source), Path(prefix), Path(cache)
+# Identity of the locally tested Windows 1.10.98 build, not a publisher signature.
+expected = "9eca51428b1a1d06edbe868f663b763991957c68128af3ee5caee1d187f4b1b7"
+def digest(path):
+    with path.open("rb") as f:
+        return hashlib.file_digest(f, "sha256").hexdigest()
+
+if not shutil.which("protontricks"):
+    raise SystemExit("TheTenths needs native protontricks (not Flatpak).")
+if digest(source) != expected:
+    raise SystemExit("This TheTenths download differs from the tested 1.10.98 build. Use --no-coach until this build has been validated.")
+app = prefix / "drive_c/users/steamuser/AppData/Local/Programs/TheTenths"
+target = app / "thetenths-client.exe"
+for path in (app, target):
+    if path.is_symlink() or not path.resolve().is_relative_to(prefix.resolve()):
+        raise SystemExit("TheTenths destination escapes the Proton prefix")
+if mode == "check":
+    print("    TheTenths client matches the tested 1.10.98 download.")
+    raise SystemExit(0)
+
+same = target.is_file() and digest(target) == expected
+keep_existing = target.exists() and not same and selection != "explicit"
+if not same and not keep_existing:
+    if subprocess.run(["pgrep", "-x", "thetenths-clien"], stdout=subprocess.DEVNULL).returncode == 0:
+        raise SystemExit("Close TheTenths before replacing its executable.")
+    if target.exists():
+        backup = cache / "backups" / ("thetenths-" + datetime.now().strftime("%Y%m%d-%H%M%S-%f"))
+        backup.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(target, backup / target.name)
+        print(f"    Previous TheTenths executable backed up in {backup}")
+    app.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(dir=app, prefix=".setup-", delete=False) as f:
+        temp = Path(f.name)
+    try:
+        shutil.copyfile(source, temp)
+        if digest(temp) != expected:
+            raise SystemExit("TheTenths copy did not match the checked download")
+        temp.chmod(0o755)
+        temp.replace(target)
+    finally:
+        temp.unlink(missing_ok=True)
+
+launcher = Path.home() / ".local/bin/thetenths"
+launcher.parent.mkdir(parents=True, exist_ok=True)
+launcher.write_text('''#!/usr/bin/env python3
+import os
+import shlex
+import subprocess
+import sys
+
+if len(sys.argv) != 1:
+    raise SystemExit("Usage: thetenths")
+env = os.environ.copy()
+env["STEAM_DIR"] = ''' + repr(steam) + '''
+env["WINEDEBUG"] = "-all"
+command = ["wine", r"C:\\users\\steamuser\\AppData\\Local\\Programs\\TheTenths\\thetenths-client.exe"]
+# Use the game's Wine server for named shared-memory telemetry. Do not log auth.
+result = subprocess.run(["protontricks", "-c", shlex.join(command), "244210"],
+                        env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+raise SystemExit(result.returncode)
+''')
+launcher.chmod(0o755)
+def desktop_quote(value):
+    return '"' + str(value).replace("\\", "\\\\").replace('"', '\\"').replace("`", "\\`").replace("$", "\\$").replace("%", "%%") + '"'
+desktop = Path.home() / ".local/share/applications/thetenths.desktop"
+desktop.parent.mkdir(parents=True, exist_ok=True)
+desktop.write_text("\n".join([
+    "[Desktop Entry]", "Type=Application", "Name=TheTenths Coach",
+    "Comment=Voice coaching and telemetry for Assetto Corsa",
+    "Exec=" + desktop_quote(launcher), "Icon=applications-games",
+    "Terminal=false", "Categories=Game;", ""]))
+if shutil.which("update-desktop-database"):
+    subprocess.run(["update-desktop-database", str(desktop.parent)], check=True,
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+print("    Keeping a different installed TheTenths build; --coach EXE explicitly replaces it." if keep_existing else
+      "    TheTenths 1.10.98 installed. Open TheTenths Coach, link your account, then start AC.")
+print("    Existing TheTenths account and preferences are preserved.")
+PY_COACH
+}
+
+if [[ "$COACH_MODE" == auto ]]; then
+  downloads_dir="$(xdg-user-dir DOWNLOAD 2> /dev/null || true)"
+  mapfile -d '' coach_candidates < <(find "${downloads_dir:-$HOME/Downloads}" -maxdepth 1 -type f -iname 'thetenths-client*.exe' -print0 2> /dev/null)
+  if (( ${#coach_candidates[@]} == 1 )); then
+    COACH_EXE="${coach_candidates[0]}"
+  elif (( ${#coach_candidates[@]} > 1 )); then
+    die "multiple TheTenths downloads found; select one with --coach EXE or use --no-coach"
+  fi
+fi
+if [[ -n "$COACH_EXE" ]]; then
+  step "Checking your local TheTenths client"
+  coach_setup check
+fi
+
 # --------------------------------------------------------------- local LFM --
 
 lfm_setup() { # check | install
@@ -1298,6 +1415,14 @@ restore_config_backup() {
     mkdir -p "$(dirname "$LFM_APP")"
     mv "$CONFIG_BACKUP/LFM App" "$LFM_APP"
   fi
+  if [[ -d "$CONFIG_BACKUP/TheTenths-profile" && ! -e "$COACH_DATA" ]]; then
+    mkdir -p "$(dirname "$COACH_DATA")"
+    mv "$CONFIG_BACKUP/TheTenths-profile" "$COACH_DATA"
+  fi
+  if [[ -d "$CONFIG_BACKUP/TheTenths-app" && ! -e "$COACH_APP" ]]; then
+    mkdir -p "$(dirname "$COACH_APP")"
+    mv "$CONFIG_BACKUP/TheTenths-app" "$COACH_APP"
+  fi
   rmdir "$CONFIG_BACKUP" 2> /dev/null \
     || warn "older settings were left in $CONFIG_BACKUP because newer ones exist"
 }
@@ -1305,7 +1430,9 @@ restore_config_backup() {
 if (( FRESH )) && [[ -d "$COMPATDATA" ]]; then
   pgrep -f '^[A-Za-z]:\\.*\\LFM App\\LFM App\.exe' > /dev/null \
     && die "Close LFM App before rebuilding its Proton prefix"
-  for saved in "Assetto Corsa" "AcTools Content Manager" lfm-hub "LFM App"; do
+  pgrep -x 'thetenths-clien' > /dev/null \
+    && die "Close TheTenths before rebuilding its Proton prefix"
+  for saved in "Assetto Corsa" "AcTools Content Manager" lfm-hub "LFM App" TheTenths-profile TheTenths-app; do
     [[ ! -e "$CONFIG_BACKUP/$saved" ]] \
       || die "Recover the previous settings backup at $CONFIG_BACKUP before rebuilding the prefix"
   done
@@ -1315,6 +1442,8 @@ if (( FRESH )) && [[ -d "$COMPATDATA" ]]; then
   [[ ! -d "$CM_DATA" || -e "$CONFIG_BACKUP/AcTools Content Manager" ]] || mv "$CM_DATA" "$CONFIG_BACKUP/"
   [[ ! -d "$LFM_DATA" || -e "$CONFIG_BACKUP/lfm-hub" ]] || mv "$LFM_DATA" "$CONFIG_BACKUP/"
   [[ ! -d "$LFM_APP" || -e "$CONFIG_BACKUP/LFM App" ]] || mv "$LFM_APP" "$CONFIG_BACKUP/"
+  [[ ! -d "$COACH_DATA" || -e "$CONFIG_BACKUP/TheTenths-profile" ]] || mv "$COACH_DATA" "$CONFIG_BACKUP/TheTenths-profile"
+  [[ ! -d "$COACH_APP" || -e "$CONFIG_BACKUP/TheTenths-app" ]] || mv "$COACH_APP" "$CONFIG_BACKUP/TheTenths-app"
   rm -rf "$COMPATDATA"
 fi
 restore_config_backup
@@ -1727,6 +1856,13 @@ if [[ -n "$LFM_INSTALLER" ]]; then
   lfm_setup install
 elif [[ "$LFM_MODE" != skip ]]; then
   info "No local LFM installer found; use --lfm EXE to install it."
+fi
+
+if [[ -n "$COACH_EXE" ]]; then
+  step "TheTenths Coach from your local download"
+  coach_setup install
+elif [[ "$COACH_MODE" != skip ]]; then
+  info "No local TheTenths client found; use --coach EXE to install it."
 fi
 
 # ----------------------------------------------------------- desktop entry --

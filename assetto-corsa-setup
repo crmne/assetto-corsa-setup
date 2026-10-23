@@ -1792,13 +1792,14 @@ files = {
     "manifest.ini": """[ABOUT]
 NAME = MOZA Rev Telemetry
 AUTHOR = Carmine Paolino
-VERSION = 1.0
-DESCRIPTION = Sends current RPM and the car's actual limiter to the local MOZA panel.
+VERSION = 2.0
+DESCRIPTION = Sends RPM, the car's actual limiter and pedal-haptic inputs to the local MOZA panel.
 
 [CORE]
 LAZY = NONE
 """,
     "OmarchyMoza.lua": """-- CSP supplies the actual limit on every frame, including after car changes.
+-- Pedal haptics also get inputs, ABS/TC activity, slip and suspension.
 -- Only loopback UDP is used; no telemetry leaves this computer.
 local socket = require('shared/socket')
 local sender = assert(socket.udp())
@@ -1806,6 +1807,12 @@ sender:settimeout(0)
 sender:setsockname('127.0.0.1', 0)
 ac.onRelease(function() sender:close() end)
 local elapsed = 0
+
+local function wheels(car, field)
+  local w = car.wheels
+  return string.format('[%.4f,%.4f,%.4f,%.4f]',
+    w[0][field], w[1][field], w[2][field], w[3][field])
+end
 
 function script.update(dt)
   elapsed = elapsed + dt
@@ -1817,11 +1824,20 @@ function script.update(dt)
   local idle = math.max(0, math.floor(car.rpmMinimum + 0.5))
   if limit <= idle then return end
   local sim = ac.getSim()
-  local rpm = (sim.isPaused or sim.isReplayActive or sim.isInMainMenu)
-    and 0 or math.max(0, math.floor(car.rpm + 0.5))
-  sender:sendto(string.format(
-    '{"protocol":"omarchy-moza-ac/1","rpm":%d,"redline":%d,"idle":%d}',
-    rpm, limit, idle), '127.0.0.1', 9997)
+  local packet = string.format('{"protocol":"omarchy-moza-ac/2","redline":%d,"idle":%d', limit, idle)
+  if sim.isPaused or sim.isReplayActive or sim.isInMainMenu then
+    -- No inputs, so no vibration either.
+    packet = packet .. ',"rpm":0}'
+  else
+    packet = packet .. string.format(
+      ',"rpm":%d,"gear":%d,"speed":%.3f,"throttle":%.3f,"brake":%.3f,"clutch":%.3f'
+      .. ',"abs":%s,"tc":%s,"slip":%s,"suspension":%s}',
+      math.max(0, math.floor(car.rpm + 0.5)), car.gear, car.speedKmh / 3.6,
+      car.gas, car.brake, car.clutch, tostring(car.absInAction == true),
+      tostring(car.tractionControlInAction == true),
+      wheels(car, 'slipRatio'), wheels(car, 'suspensionTravel'))
+  end
+  sender:sendto(packet, '127.0.0.1', 9997)
 end
 """,
 }
@@ -1840,7 +1856,7 @@ for name, data in files.items():
         shutil.copy2(dest, backup / name)
     dest.parent.mkdir(parents=True, exist_ok=True)
     dest.write_text(data)
-print("    MOZA receives the car's actual RPM limit via localhost UDP :9997 next session.")
+print("    MOZA receives the car's RPM limit and pedal-haptic inputs via localhost UDP :9997 next session.")
 if backup.exists():
     print(f"    Previous telemetry app backed up in {backup}")
 PY_MOZA

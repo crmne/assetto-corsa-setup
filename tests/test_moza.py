@@ -52,7 +52,7 @@ class MozaTelemetryTests(unittest.TestCase):
         self.assertEqual(list(outside.iterdir()), [])
 
     @unittest.skipUnless(shutil.which("luajit"), "LuaJIT required to exercise CSP sender")
-    def test_sender_uses_current_car_limit_and_suppresses_replay(self):
+    def test_sender_reports_limit_and_haptic_inputs_and_suppresses_replay(self):
         self.assertEqual(self.install().returncode, 0)
         runner = self.root / "runtime.lua"
         runner.write_text('''
@@ -65,7 +65,13 @@ local sender = {
   sendto = function(_, data, host, n) packets[#packets + 1] = data; peer = host; port = n end
 }
 package.preload['shared/socket'] = function() return {udp = function() return sender end} end
-local car = {rpm = 6305, rpmLimiter = 6500, rpmMinimum = 1250}
+local function wheel(slip, travel) return {slipRatio = slip, suspensionTravel = travel} end
+local function live(rpm, limit, idle)
+  return {rpm = rpm, rpmLimiter = limit, rpmMinimum = idle, gear = 3, speedKmh = 180,
+    gas = 1, brake = 0, clutch = 0.25, absInAction = false, tractionControlInAction = true,
+    wheels = {[0] = wheel(0.01, 0.05), wheel(0.02, 0.05), wheel(0.3, 0.06), wheel(-0.4, 0.06)}}
+end
+local car = live(6305, 6500, 1250)
 local sim = {}
 ac = {getCar = function(index) assert(index == 0); return car end,
   getSim = function() return sim end, onRelease = function() end}
@@ -74,17 +80,19 @@ dofile(arg[1])
 script.update(1/120)
 assert(#packets == 0)
 script.update(1/120)
-assert(packets[1] == '{"protocol":"omarchy-moza-ac/1","rpm":6305,"redline":6500,"idle":1250}')
+assert(packets[1] == '{"protocol":"omarchy-moza-ac/2","redline":6500,"idle":1250,"rpm":6305,'
+  .. '"gear":3,"speed":50.000,"throttle":1.000,"brake":0.000,"clutch":0.250,"abs":false,"tc":true,'
+  .. '"slip":[0.0100,0.0200,0.3000,-0.4000],"suspension":[0.0500,0.0500,0.0600,0.0600]}', packets[1])
 assert(peer == '127.0.0.1' and port == 9997)
-car = {rpm = 485, rpmLimiter = 500, rpmMinimum = -1}
+car = live(485, 500, -1)
 script.update(1/60)
-assert(packets[2] == '{"protocol":"omarchy-moza-ac/1","rpm":485,"redline":500,"idle":0}')
+assert(packets[2]:find('"redline":500,"idle":0,"rpm":485,', 1, true))
 car.rpm = 600
 script.update(1/60)
 assert(packets[3]:find('"redline":500', 1, true))
 sim.isReplayActive = true
 script.update(1/60)
-assert(packets[4]:find('"rpm":0', 1, true))
+assert(packets[4] == '{"protocol":"omarchy-moza-ac/2","redline":500,"idle":0,"rpm":0}', packets[4])
 car.rpmLimiter = 0
 script.update(1/60)
 assert(#packets == 4)
